@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-04-21
+
+### Changed
+
+- **npm Trusted Publishing** — replaced long-lived `NPM_TOKEN` secret with OIDC Trusted Publishing on npmjs.com; publish step now relies on `id-token: write` + `--provenance` with no stored secret
+
 ## [0.14.0] - 2026-04-19
 
 Minor release centered on interactive orchestration changes: the new `omx question` blocking-question entrypoint, deep-interview and autoresearch flow tightening, advisory triage routing, explicit runtime run outcomes, specialist-routing cleanup, and release-proof hardening for the shipped package.
