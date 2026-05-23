@@ -69,7 +69,7 @@ export function getRootModelName(config: string): string | undefined {
   return unwrapTomlString(parseRootKeyValues(config).get("model"));
 }
 
-function parseRootKeyValues(config: string): Map<string, string> {
+export function parseRootKeyValues(config: string): Map<string, string> {
   const values = new Map<string, string>();
   const lines = config.split(/\r?\n/);
   for (const line of lines) {

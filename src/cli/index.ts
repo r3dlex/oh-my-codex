@@ -59,6 +59,7 @@ import {
   sessionModelInstructionsPath,
   writeSessionModelInstructionsFile,
 } from "../hooks/agents-overlay.js";
+import { parseRootKeyValues } from "../config/generator.js";
 import {
   readSessionState,
   writeSessionStart,
@@ -2312,12 +2313,30 @@ async function preLaunch(
     // Non-fatal
   }
 
-  // 2. Generate runtime overlay + write session-scoped model instructions file
+  // 2. Read active profile settings for context management decisions
+  const profileSettings = (() => {
+    try {
+      const configPath = codexConfigPath();
+      if (!existsSync(configPath)) return null;
+      const raw = readFileSync(configPath, "utf-8");
+      const rootValues = parseRootKeyValues(raw);
+      const contextWindow = parseInt(rootValues.get("model_context_window") || "", 10);
+      const autoCompactLimit = parseInt(rootValues.get("model_auto_compact_token_limit") || "", 10);
+      return {
+        contextWindow: isNaN(contextWindow) ? undefined : contextWindow,
+        autoCompactLimit: isNaN(autoCompactLimit) ? undefined : autoCompactLimit,
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  // 3. Generate runtime overlay + write session-scoped model instructions file
   const orchestrationMode = await resolveSessionOrchestrationMode(
     cwd,
     sessionId,
   );
-  const overlay = await generateOverlay(cwd, sessionId, { orchestrationMode });
+  const overlay = await generateOverlay(cwd, sessionId, { orchestrationMode, profileSettings });
   const launchAppendix = await readLaunchAppendInstructions();
   const dirtyWorktreeGuidance = worktreeDirty
     ? `\n\n## Session start: dirty worktree detected\n\nThis worktree has uncommitted changes that were present when the session launched.\nBefore executing the requested task, resolve the dirty state first:\n1. Review uncommitted changes with \`git status\` and \`git diff\`.\n2. Commit, stash, or discard changes as appropriate.\n3. Then proceed with the original task.`
@@ -2330,11 +2349,11 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
       : `${overlay}${dirtyWorktreeGuidance}`;
   await writeSessionModelInstructionsFile(cwd, sessionId, sessionInstructions);
 
-  // 3. Write session state
+  // 4. Write session state
   await resetSessionMetrics(cwd, sessionId);
   await writeSessionStart(cwd, sessionId);
 
-  // 4. Start notify fallback watcher (best effort)
+  // 5. Start notify fallback watcher (best effort)
   try {
     await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority, sessionId });
   } catch (err) {

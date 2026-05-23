@@ -195,6 +195,18 @@
       "type": "file"
     },
     {
+      "path": "CHANGELOG.md",
+      "accessCount": 2,
+      "lastAccessed": 1776762081582,
+      "type": "file"
+    },
+    {
+      "path": "Cargo.toml",
+      "accessCount": 2,
+      "lastAccessed": 1776763094542,
+      "type": "file"
+    },
+    {
       "path": ".codex/skills/karpathy-guidelines/SKILL.md",
       "accessCount": 1,
       "lastAccessed": 1776289732138,

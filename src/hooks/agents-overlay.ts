@@ -135,6 +135,16 @@ export type SessionOrchestrationMode = "default" | "team";
 
 export interface GenerateOverlayOptions {
   orchestrationMode?: SessionOrchestrationMode;
+  /** Resolved profile settings from config.toml. If not provided, reads from codexHome(). */
+  profileSettings?: ProfileSettings | null;
+}
+
+/** Model profile settings for context management decisions. */
+export interface ProfileSettings {
+  /** model_context_window from the active profile (or root level). */
+  contextWindow?: number;
+  /** model_auto_compact_token_limit from the active profile (or root level). */
+  autoCompactLimit?: number;
 }
 
 function joinSections(sections: OverlaySection[]): string {
@@ -307,12 +317,31 @@ async function readProjectMemorySummary(cwd: string): Promise<string> {
   }
 }
 
-function getCompactionInstructions(): string {
+function getCompactionThresholdPct(
+  profileSettings: ProfileSettings | null | undefined,
+): string {
+  if (
+    profileSettings?.contextWindow &&
+    profileSettings?.autoCompactLimit &&
+    profileSettings.contextWindow > 0
+  ) {
+    const pct = Math.round(
+      (profileSettings.autoCompactLimit / profileSettings.contextWindow) * 100,
+    );
+    return `${pct}%`;
+  }
+  return "90%";
+}
+
+function getCompactionInstructions(
+  profileSettings: ProfileSettings | null | undefined,
+): string {
+  const thresholdPct = getCompactionThresholdPct(profileSettings);
   return [
     "Before context compaction, preserve critical state:",
     "1. Write progress checkpoint via state_write MCP tool",
     "2. Save key decisions to notepad via notepad_write_working",
-    "3. If context is >80% full, proactively checkpoint state",
+    `3. If context is >${thresholdPct} full, proactively checkpoint state`,
   ].join("\n");
 }
 
@@ -471,7 +500,7 @@ export async function generateOverlay(
   // Compaction protocol (max 400 chars) - required
   sections.push({
     key: "compaction",
-    text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(), 380)}`,
+    text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(options.profileSettings), 380)}`,
     optional: false,
   });
 
@@ -489,7 +518,7 @@ export async function generateOverlay(
       { key: "session", text: truncate(sessionMeta, 200), optional: false },
       {
         key: "compaction",
-        text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(), 380)}`,
+        text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(options.profileSettings), 380)}`,
         optional: false,
       },
     ],
