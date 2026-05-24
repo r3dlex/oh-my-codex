@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
 import {
   loadRolePrompt,
   isKnownRole,
   listAvailableRoles,
   routeTaskToRole,
 } from '../role-router.js';
+
+const repoRoot = join(fileURLToPath(new URL('../../../', import.meta.url)));
 
 describe('role-router', () => {
   // ─── Layer 1: Prompt Loading ──────────────────────────────────────
@@ -88,6 +91,11 @@ describe('role-router', () => {
       const roles = await listAvailableRoles('/tmp/nonexistent-dir-' + Date.now());
       assert.deepEqual(roles, []);
     });
+
+    it('does not expose command-specific AGENTS instruction files as roles from the repo prompts directory', async () => {
+      const roles = await listAvailableRoles(join(repoRoot, 'prompts'));
+      assert.equal(roles.some((role) => role.endsWith('-AGENTS')), false);
+    });
   });
 
   // ─── Layer 2: Heuristic Role Routing ──────────────────────────────
@@ -105,9 +113,9 @@ describe('role-router', () => {
       assert.equal(result.confidence, 'high');
     });
 
-    it('routes build error tasks to build-fixer', () => {
+    it('routes build error tasks to debugger', () => {
       const result = routeTaskToRole('Fix build', 'Resolve tsc type errors in the compile step', 'team-fix', 'executor');
-      assert.equal(result.role, 'build-fixer');
+      assert.equal(result.role, 'debugger');
       assert.equal(result.confidence, 'high');
     });
 
@@ -200,9 +208,9 @@ describe('role-router', () => {
       assert.equal(changelog.confidence, 'high');
     });
 
-    it('routes security tasks to security-reviewer', () => {
+    it('routes security tasks to code-reviewer', () => {
       const result = routeTaskToRole('Security audit', 'Check for XSS and injection vulnerabilities', 'team-verify', 'executor');
-      assert.equal(result.role, 'security-reviewer');
+      assert.equal(result.role, 'code-reviewer');
       assert.equal(result.confidence, 'high');
     });
 

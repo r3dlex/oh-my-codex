@@ -22,6 +22,7 @@ import {
   listInstalledSkillDirectories,
   omxNotepadPath,
   omxProjectMemoryPath,
+  omxStateDir,
   packageRoot,
 } from "../utils/paths.js";
 import {
@@ -40,6 +41,11 @@ import {
   listActiveSkills,
   readVisibleSkillActiveState,
 } from "../state/skill-active.js";
+import {
+  OMX_GENERATED_AGENTS_MARKER,
+  OMX_MANAGED_AGENTS_END_MARKER,
+  OMX_MANAGED_AGENTS_START_MARKER,
+} from "../utils/agents-md.js";
 
 const START_MARKER = "<!-- OMX:RUNTIME:START -->";
 const END_MARKER = "<!-- OMX:RUNTIME:END -->";
@@ -51,7 +57,7 @@ const SKILL_REFERENCE_PATTERN = /\/skills\/([^/\s`]+)\/SKILL\.md\b/g;
 // ── Lock helpers ─────────────────────────────────────────────────────────────
 
 function lockPath(cwd: string): string {
-  return join(cwd, ".omx", "state", "agents-md.lock");
+  return join(omxStateDir(cwd), "agents-md.lock");
 }
 
 async function acquireLock(
@@ -135,16 +141,6 @@ export type SessionOrchestrationMode = "default" | "team";
 
 export interface GenerateOverlayOptions {
   orchestrationMode?: SessionOrchestrationMode;
-  /** Resolved profile settings from config.toml. If not provided, reads from codexHome(). */
-  profileSettings?: ProfileSettings | null;
-}
-
-/** Model profile settings for context management decisions. */
-export interface ProfileSettings {
-  /** model_context_window from the active profile (or root level). */
-  contextWindow?: number;
-  /** model_auto_compact_token_limit from the active profile (or root level). */
-  autoCompactLimit?: number;
 }
 
 function joinSections(sections: OverlaySection[]): string {
@@ -317,31 +313,12 @@ async function readProjectMemorySummary(cwd: string): Promise<string> {
   }
 }
 
-function getCompactionThresholdPct(
-  profileSettings: ProfileSettings | null | undefined,
-): string {
-  if (
-    profileSettings?.contextWindow &&
-    profileSettings?.autoCompactLimit &&
-    profileSettings.contextWindow > 0
-  ) {
-    const pct = Math.round(
-      (profileSettings.autoCompactLimit / profileSettings.contextWindow) * 100,
-    );
-    return `${pct}%`;
-  }
-  return "90%";
-}
-
-function getCompactionInstructions(
-  profileSettings: ProfileSettings | null | undefined,
-): string {
-  const thresholdPct = getCompactionThresholdPct(profileSettings);
+function getCompactionInstructions(): string {
   return [
     "Before context compaction, preserve critical state:",
-    "1. Write progress checkpoint via state_write MCP tool",
-    "2. Save key decisions to notepad via notepad_write_working",
-    `3. If context is >${thresholdPct} full, proactively checkpoint state`,
+    "1. Write progress checkpoint via `omx state write --input '<json>' --json`",
+    "2. Save key decisions via `omx notepad write-working --input '<json>' --json`",
+    "3. If context is >80% full, proactively checkpoint state",
   ].join("\n");
 }
 
@@ -500,7 +477,7 @@ export async function generateOverlay(
   // Compaction protocol (max 400 chars) - required
   sections.push({
     key: "compaction",
-    text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(options.profileSettings), 380)}`,
+    text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(), 380)}`,
     optional: false,
   });
 
@@ -518,7 +495,7 @@ export async function generateOverlay(
       { key: "session", text: truncate(sessionMeta, 200), optional: false },
       {
         key: "compaction",
-        text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(options.profileSettings), 380)}`,
+        text: `**Compaction Protocol:**\n${truncate(getCompactionInstructions(), 380)}`,
         optional: false,
       },
     ],
@@ -656,6 +633,30 @@ function dropShadowedSkillReferenceLines(
   return keptLines.join("\n");
 }
 
+function stripOmxManagedAgentsBlocks(content: string): string {
+  let next = content;
+
+  while (true) {
+    const startIndex = next.indexOf(OMX_MANAGED_AGENTS_START_MARKER);
+    if (startIndex < 0) return next;
+
+    const endIndex = next.indexOf(
+      OMX_MANAGED_AGENTS_END_MARKER,
+      startIndex + OMX_MANAGED_AGENTS_START_MARKER.length,
+    );
+    if (endIndex < 0) return next;
+
+    const replaceEnd = endIndex + OMX_MANAGED_AGENTS_END_MARKER.length;
+    next = `${next.slice(0, startIndex)}${next.slice(replaceEnd)}`;
+  }
+}
+
+function stripGeneratedOmxAgentsForSession(content: string): string {
+  const withoutManagedBlocks = stripOmxManagedAgentsBlocks(content).trim();
+  if (withoutManagedBlocks.includes(OMX_GENERATED_AGENTS_MARKER)) return "";
+  return withoutManagedBlocks;
+}
+
 /**
  * Build a session-scoped AGENTS.md that combines user-level CODEX_HOME
  * instructions, project instructions (if any), and the runtime overlay,
@@ -670,7 +671,8 @@ export async function writeSessionModelInstructionsFile(
   await mkdir(dirname(sessionPath), { recursive: true });
 
   const baseParts: string[] = [];
-  const sourcePaths = [join(codexHome(), "AGENTS.md"), join(cwd, "AGENTS.md")];
+  const userAgentsPath = join(codexHome(), "AGENTS.md");
+  const sourcePaths = [userAgentsPath, join(cwd, "AGENTS.md")];
   const seenPaths = new Set<string>();
   const installedSkills = await listInstalledSkillDirectories(cwd);
   const projectSkillNames = new Set(
@@ -685,11 +687,13 @@ export async function writeSessionModelInstructionsFile(
 
     let content = await readFile(sourcePath, "utf-8");
     content = stripOverlayContent(content).trim();
-    if (sourcePath === join(codexHome(), "AGENTS.md")) {
+    if (sourcePath === userAgentsPath) {
       content = dropShadowedSkillReferenceLines(
         content,
         projectSkillNames,
       ).trim();
+    } else {
+      content = stripGeneratedOmxAgentsForSession(content);
     }
     if (!content) continue;
     baseParts.push(content);

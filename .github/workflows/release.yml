@@ -41,6 +41,7 @@ jobs:
           const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
           const workspace = TOML.parse(fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf-8'));
           const expectedMembers = [
+            'crates/omx-api',
             'crates/omx-explore',
             'crates/omx-mux',
             'crates/omx-runtime-core',
@@ -48,6 +49,7 @@ jobs:
             'crates/omx-sparkshell',
           ];
           const manifests = [
+            'crates/omx-api/Cargo.toml',
             'crates/omx-explore/Cargo.toml',
             'crates/omx-runtime-core/Cargo.toml',
             'crates/omx-mux/Cargo.toml',
@@ -109,8 +111,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Install Linux musl toolchain
         if: runner.os == 'Linux'
@@ -164,7 +167,9 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - name: Install cargo-dist
         run: cargo install cargo-dist --locked --version "$CARGO_DIST_VERSION"
       - name: Generate release manifest from cargo-dist plan
@@ -178,7 +183,7 @@ jobs:
             --artifacts-dir release-assets \
             --out release-assets/native-release-manifest.json \
             --release-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" \
-            --require-products "omx-explore-harness,omx-sparkshell"
+            --require-products "omx-api,omx-explore-harness,omx-sparkshell"
       - name: Upload release asset bundle for follow-up jobs
         uses: actions/upload-artifact@v4
         with:
@@ -265,6 +270,7 @@ jobs:
           const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf-8'));
           const workspace = TOML.parse(fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf-8'));
           const expectedMembers = [
+            'crates/omx-api',
             'crates/omx-explore',
             'crates/omx-mux',
             'crates/omx-runtime-core',
@@ -272,6 +278,7 @@ jobs:
             'crates/omx-sparkshell',
           ];
           const manifests = [
+            'crates/omx-api/Cargo.toml',
             'crates/omx-explore/Cargo.toml',
             'crates/omx-runtime-core/Cargo.toml',
             'crates/omx-mux/Cargo.toml',

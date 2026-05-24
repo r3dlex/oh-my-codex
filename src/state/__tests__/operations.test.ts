@@ -80,7 +80,7 @@ exit 1
 }
 
 describe('state operations directory initialization', () => {
-  it('creates .omx/state for state operations without setup', async () => {
+  it('keeps state_list_active side-effect-free without setup', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-test-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -92,15 +92,91 @@ describe('state operations directory initialization', () => {
         workingDirectory: wd,
       });
 
-      assert.equal(existsSync(stateDir), true);
-      assert.equal(existsSync(tmuxHookConfig), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(response.payload, { active_modes: [] });
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('bootstraps tmux-hook from the current tmux pane when available', async () => {
+  it('keeps state_get_status side-effect-free when session_id is provided', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-status-readonly-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionDir = join(stateDir, 'sessions', 'sess1');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await executeStateOperation('state_get_status', {
+        workingDirectory: wd,
+        session_id: 'sess1',
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(response.payload, { statuses: {} });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not treat root fallback as active for explicit session list-active decisions', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-active-scope-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(
+        join(stateDir, 'ralph-state.json'),
+        JSON.stringify({
+          active: true,
+          mode: 'ralph',
+          current_phase: 'executing',
+        }, null, 2),
+      );
+
+      const activeResponse = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: 'missing-session',
+      });
+
+      assert.deepEqual(activeResponse.payload, { active_modes: [] });
+
+      const readResponse = await executeStateOperation('state_read', {
+        workingDirectory: wd,
+        session_id: 'missing-session',
+        mode: 'ralph',
+      });
+      assert.equal((readResponse.payload as { active?: unknown }).active, true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps missing state_read side-effect-free without setup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-readonly-missing-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await executeStateOperation('state_read', {
+        workingDirectory: wd,
+        mode: 'deep-interview',
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(response.payload, { exists: false, mode: 'deep-interview' });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps tmux-hook from the current tmux pane for mutating state operations', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-live-'));
     try {
       const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
@@ -113,10 +189,14 @@ describe('state operations directory initialization', () => {
           PATH: `${fakeBin}:${process.env.PATH || ''}`,
         },
         async () => {
-          const response = await executeStateOperation('state_list_active', {
+          const response = await executeStateOperation('state_write', {
             workingDirectory: wd,
+            mode: 'deep-interview',
+            active: true,
+            current_phase: 'deep-interview',
           });
-          assert.deepEqual(response.payload, { active_modes: [] });
+          assert.equal(response.isError, undefined);
+          assert.equal((response.payload as { success?: boolean }).success, true);
         },
       );
 
@@ -197,19 +277,84 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('creates session-scoped state directory when session_id is provided', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-session-'));
+  it('lists active modes from the explicit session scope without leaking a sibling Ralph session', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-foreign-ralph-scope-'));
     try {
-      const sessionDir = join(wd, '.omx', 'state', 'sessions', 'sess1');
-      assert.equal(existsSync(sessionDir), false);
+      const currentSessionDir = join(wd, '.omx', 'state', 'sessions', 'sess-current');
+      const foreignSessionDir = join(wd, '.omx', 'state', 'sessions', 'sess-foreign');
+      await mkdir(currentSessionDir, { recursive: true });
+      await mkdir(foreignSessionDir, { recursive: true });
+      await writeFile(
+        join(foreignSessionDir, 'ralph-state.json'),
+        JSON.stringify({ active: true, current_phase: 'executing' }, null, 2),
+      );
 
-      const response = await executeStateOperation('state_get_status', {
+      const response = await executeStateOperation('state_list_active', {
         workingDirectory: wd,
-        session_id: 'sess1',
+        session_id: 'sess-current',
       });
 
-      assert.equal(existsSync(sessionDir), true);
-      assert.deepEqual(response.payload, { statuses: {} });
+      assert.deepEqual(response.payload, { active_modes: [] });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('isolates same workflow state across explicit session ids when starting and clearing one session', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-same-workflow-isolation-'));
+    try {
+      const writeA = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: 'sess-a',
+        mode: 'ralph',
+        active: true,
+        iteration: 1,
+        max_iterations: 5,
+        current_phase: 'executing',
+        state: { task_slug: 'session-a-task' },
+      });
+      assert.equal(writeA.isError, undefined);
+
+      const sessionAStatePath = join(wd, '.omx', 'state', 'sessions', 'sess-a', 'ralph-state.json');
+      const sessionACanonicalPath = join(wd, '.omx', 'state', 'sessions', 'sess-a', 'skill-active-state.json');
+      const sessionAStateBefore = JSON.parse(await readFile(sessionAStatePath, 'utf-8')) as Record<string, unknown>;
+      const sessionACanonicalBefore = JSON.parse(await readFile(sessionACanonicalPath, 'utf-8')) as Record<string, unknown>;
+
+      const writeB = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: 'sess-b',
+        mode: 'ralph',
+        active: true,
+        iteration: 1,
+        max_iterations: 5,
+        current_phase: 'executing',
+        state: { task_slug: 'session-b-task' },
+      });
+      assert.equal(writeB.isError, undefined);
+
+      assert.deepEqual(JSON.parse(await readFile(sessionAStatePath, 'utf-8')), sessionAStateBefore);
+      assert.deepEqual(JSON.parse(await readFile(sessionACanonicalPath, 'utf-8')), sessionACanonicalBefore);
+
+      await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        session_id: 'sess-b',
+        mode: 'ralph',
+      });
+
+      const activeA = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: 'sess-a',
+      });
+      assert.deepEqual(activeA.payload, { active_modes: ['ralph'] });
+
+      const activeB = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: 'sess-b',
+      });
+      assert.deepEqual(activeB.payload, { active_modes: [] });
+
+      assert.deepEqual(JSON.parse(await readFile(sessionAStatePath, 'utf-8')), sessionAStateBefore);
+      assert.deepEqual(JSON.parse(await readFile(sessionACanonicalPath, 'utf-8')), sessionACanonicalBefore);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -236,6 +381,98 @@ describe('state operations directory initialization', () => {
       for (let i = 0; i < 16; i++) {
         assert.equal(state[`k${i}`], i);
       }
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report a legacy root mode active after clearing the current session scope', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-clear-root-fallback-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-clear';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(
+        join(stateDir, 'deep-interview-state.json'),
+        JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'legacy-root' }, null, 2),
+      );
+      await writeFile(
+        join(sessionDir, 'deep-interview-state.json'),
+        JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'session-active' }, null, 2),
+      );
+
+      await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        mode: 'deep-interview',
+      });
+
+      assert.equal(existsSync(join(sessionDir, 'deep-interview-state.json')), true);
+      assert.equal(existsSync(join(stateDir, 'deep-interview-state.json')), true);
+
+      const sessionState = JSON.parse(
+        await readFile(join(sessionDir, 'deep-interview-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(sessionState.active, false);
+      assert.equal(sessionState.current_phase, 'cleared');
+
+      const activeResponse = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+      });
+      assert.deepEqual(activeResponse.payload, { active_modes: [] });
+
+      const statusResponse = await executeStateOperation('state_get_status', {
+        workingDirectory: wd,
+        mode: 'deep-interview',
+      });
+      const statuses = (statusResponse.payload as {
+        statuses?: Record<string, { active?: boolean; phase?: string }>;
+      }).statuses || {};
+      assert.equal(statuses['deep-interview']?.active, false);
+      assert.equal(statuses['deep-interview']?.phase, 'cleared');
+
+      const readResponse = await executeStateOperation('state_read', {
+        workingDirectory: wd,
+        mode: 'deep-interview',
+      });
+      const readBody = readResponse.payload as Record<string, unknown>;
+      assert.equal(readBody.active, false);
+      assert.equal(readBody.current_phase, 'cleared');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('all_sessions clear removes session-only canonical workflow state', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-all-sessions-session-only-'));
+    try {
+      const sessionDir = join(wd, '.omx', 'state', 'sessions', 'sess-only');
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, 'ralph-state.json'),
+        JSON.stringify({ active: true, mode: 'ralph', current_phase: 'executing' }, null, 2),
+      );
+      await writeFile(
+        join(sessionDir, 'skill-active-state.json'),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'ralph',
+          session_id: 'sess-only',
+          active_skills: [{ skill: 'ralph', phase: 'executing', active: true, session_id: 'sess-only' }],
+        }, null, 2),
+      );
+
+      const cleared = await executeStateOperation('state_clear', {
+        workingDirectory: wd,
+        mode: 'ralph',
+        all_sessions: true,
+      });
+      assert.equal(cleared.isError, undefined);
+
+      assert.equal(existsSync(join(sessionDir, 'ralph-state.json')), false);
+      assert.equal(existsSync(join(sessionDir, 'skill-active-state.json')), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

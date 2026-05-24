@@ -4,6 +4,432 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-05-23
+
+Patch release for the closed post-`0.18.1` issue train. This release promotes the `dev` fixes for every currently closed, completed GitHub issue opened after `v0.18.1`, plus the Prometheus Strict planner surface and Ultragoal HUD progress display that also merged during the compare range.
+
+### Added
+
+- **Prometheus Strict recipe workflow** — restores a recipe-only interview-driven planner surface with `omx question` routing, native agent definitions, catalog entries, mirrored plugin skill files, and dogfood documentation (#2415, #2437).
+- **Ultragoal HUD progress** — HUD output now summarizes active Ultragoal progress and tightens review follow-up handling so long-running durable goals stay visible during execution (#2472).
+
+### Changed
+
+- **Autopilot and planning handoffs are more auditable** — Autopilot now exposes the full durable phase chain, ralplan consensus requires explicit Architect/Critic evidence before handoff, and ralplan examples point to Ultragoal as the default durable execution path (#2432, #2447, #2455).
+- **Deep-interview remains a requirements boundary** — deep-interview handoffs now avoid implicit implementation and preserve explicit execution transition requirements (#2427).
+- **Research workflow guidance is clearer** — best-practice research, Autoresearch, Autoresearch Goal, and ralplan now have sharper boundaries, with in-repo docs CSS paths verified (#2469).
+
+### Fixed
+
+- **Plugin/native hook reliability** — doctor no longer warns about missing setup-owned `hooks.json` when plugin-mode hook coverage is valid, native review subagents no longer activate workflow state from quoted parent keywords, and project-scope runtime `CODEX_HOME` launches no longer duplicate native hooks or lose trust state (#2431, #2448, #2471).
+- **Tmux/HUD/madmax stability** — tmux 3.2a-compatible resize hooks, per-run madmax detached lock identity, stale-lock diagnostics/recovery, boxed `OMX_ROOT` forwarding, per-leader HUD ownership, and clearer same-directory madmax lock diagnostics are included (#2434, #2436, #2442, #2452, #2461, #2463).
+- **Team and notification safety** — team startup-direct evidence gates, team Stop state isolation, and bounded Codex Desktop `turn-ended` notification dispatch prevent false success paths and runaway notify storms (#2439, #2450, #2457).
+- **Ultragoal recovery** — unavailable Codex goal storage such as `no such table: thread_goals` is classified and checkpointed as non-terminal blocked recovery evidence instead of trapping completed work (#2467).
+
+### Closed issue audit
+
+Opened after `v0.18.1` and currently closed:
+
+- Completed and merged to `dev`: #2429→#2431, #2430→#2432, #2433→#2434, #2435→#2436, #2438→#2439, #2440→#2442, #2443→#2447, #2445→#2448, #2449→#2450, #2451→#2452, #2453→#2455, #2456→#2457, #2460→#2461, #2462→#2463, #2466→#2467, #2468→#2469, #2470→#2471.
+- Closed as not planned / not an execution-track merge: #2428 (too broad; requested narrower follow-ups) and #2465 (contribution-gate closure). These had no required release merge.
+
+### PRs
+
+- #2415, #2427, #2431, #2432, #2434, #2436, #2437, #2439, #2442, #2447, #2448, #2450, #2452, #2455, #2457, #2461, #2463, #2467, #2469, #2471, #2472
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.2.md`.
+
+
+## [0.18.0] - 2026-05-19
+
+Minor release focused on local-generation infrastructure, SparkShell operator safety, and runtime reliability after `0.17.3`. The release adds the OMX API gateway, routes SparkShell summaries through the local API surface, improves real/local generation compatibility, and closes a cluster of hook, notify, tmux, Windows MCP, and workflow-state regressions found while preparing the release.
+
+### Added
+
+- **OMX API gateway for local generation** — new `omx api` support provides a localhost-compatible API surface for OMX-owned generation flows and SparkShell summaries.
+- **Bounded best-practice research workflow** — `$best-practice-research` gives release and implementation work an upstream-evidence-first workflow with explicit bounds.
+- **SparkShell diagnostics for operators** — SparkShell can summarize team panes, cache pane observations incrementally, preserve passthrough contracts, and keep raw secrets out of summaries.
+
+### Changed
+
+- **Real/local generation compatibility** — local real generation paths and Responses metadata propagation are aligned with the OMX API gateway.
+- **Release and CI readiness** — targeted CI lanes reduce wasted PR work, API CLI tests are more reliable under load, and the release train now includes `omx api` / `omx sparkshell` smoke coverage.
+- **Workflow durability across compaction** — autopilot review state and autoresearch-goal Stop reconciliation survive the handoff conditions that previously caused review skips or stale loops.
+
+### Fixed
+
+- **Notify recursion and fork bombs** — stale wrapper recursion, `previousNotify` self-reference, fallback watcher respawns, and dispatcher recursive forks are blocked.
+- **Stop/hook false positives** — stale Ralph/ralplan state, autoresearch-goal reconciliation drift, MCP transport false positives, and tmux diagnostic false positives no longer trigger erroneous lifecycle loops.
+- **Team/tmux/HUD/Windows reliability** — wrapped tmux drafts are no longer trusted as sent input, HUD resize hooks survive reflow, worker tmux rc fan-out is stopped, provider env vars are preserved for directly launched tmux sessions, and Windows MCP siblings avoid duplicate watchdog collisions.
+- **Advisor prompt compatibility** — `omx ask` role prompts that start with YAML frontmatter are handled correctly.
+- **0.18.0 release blockers** — API auth defaults, request bounds, redaction, help text, version metadata, and smoke commands were hardened before release.
+
+### PRs
+
+- #2295, #2332, #2334, #2335, #2338, #2339, #2341, #2342, #2344, #2345, #2347, #2349, #2351, #2357, #2359, #2360, #2361, #2365, #2367, #2372, #2374, #2375, #2376
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.0.md`.
+
+## [0.17.3] - 2026-05-14
+
+### Highlights
+
+- **Team launch works again with CLI-first/plugin Codex configs** — Codex team workers no longer synthesize first-party `mcp_servers.<omx>` config tables when those servers are absent from `CODEX_HOME/config.toml`, avoiding Codex's `invalid transport` startup failure while preserving the v0.17.1 worker-isolation behavior for legacy configured servers.
+- **AGENTS contract and plugin metadata hardening ride with the hotfix train** — the compare range also includes AGENTS overwrite protection and plugin/question test metadata alignment from `dev` after `0.17.2`.
+
+### Fixes / compatibility
+
+- `OMX_TEAM_WORKER_MCP_COMPAT=1` remains a supported escape hatch and still suppresses worker MCP disable overrides.
+- Legacy configs that explicitly declare `omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`, `omx_wiki`, or `omx_hermes` still get those servers disabled for Codex team workers by default.
+- CLI-first/plugin configs without those first-party MCP tables now launch team workers normally instead of failing before readiness.
+
+### Validation
+
+- `npm run build`
+- `node --test dist/team/__tests__/tmux-session.test.js`
+- `npm run check:no-unused`
+- Live default team launch smoke: `./dist/cli/omx.js team 1:explore "default smoke launch fixed"`
+- Live compatibility smoke: `OMX_TEAM_WORKER_MCP_COMPAT=1 ./dist/cli/omx.js team 1:explore "compat smoke launch still fixed"`
+
+## [0.17.2] - 2026-05-14
+
+Hotfix release for the `omx question` leader-pane resume regression observed after structured question / Hermes coordination integration.
+
+### Fixed
+
+- **Structured question answers resume the leader pane again** — answered question records with persisted renderer `return_target` metadata now send the bounded `[omx question answered]` notice back through the existing safe tmux-send-keys path for both local UI answers and Hermes/MCP structured submissions.
+- **Hermes question bridge contract clarified** — coordinators still submit bounded structured answers to question records, but OMX-owned records may use their persisted return-pane metadata for the leader resume notice; this is not an arbitrary terminal relay.
+
+### Validation
+
+- `npm run build`
+- `env -u OMX_STATE_ROOT -u OMX_ROOT -u OMX_SESSION_ID -u CODEX_SESSION_ID -u SESSION_ID node --test dist/question/__tests__/state.test.js dist/question/__tests__/ui.test.js dist/mcp/__tests__/hermes-bridge.test.js dist/question/__tests__/renderer.test.js`
+- `npm run check:no-unused`
+- `npx biome lint src/question src/mcp/hermes-bridge.ts`
+
+### Release metadata
+
+- Node and Cargo package metadata are bumped to `0.17.2` for the hotfix cut.
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.17.2.md`.
+- PR inventory: #2330.
+
+## [0.17.1] - 2026-05-14
+
+Patch release focused on post-`0.17.0` release readiness and runtime-coordination hardening: Team + Ultragoal handoff guidance, question bridge events, setup MCP removal confirmation, HUD/tmux resize ownership, Team startup readiness, native session overlay preservation, and audit-clean release metadata.
+
+### Added
+
+- **Team + Ultragoal bridge guidance** — planning, ralplan, Team, and Ultragoal now document leader-owned goal/ledger state with Team-owned parallel execution evidence.
+- **Question bridge events** — question coordination now records structured bridge events for bounded Hermes/MCP integrations.
+
+### Changed
+
+- **Approved execution handoff contract** — approved repository context replaces the older context-pack handoff path; approved PRD/test-spec artifacts and Team evidence are now the release-train source of truth.
+- **Setup MCP removal** — setup-managed MCP removal is explicitly confirmed instead of silently applying default removals.
+- **Lore commit guard** — compact compliant commit messages are accepted while preserving the required OmX co-author trailer.
+
+### Fixed
+
+- **Release audit and version metadata** — Node/Cargo metadata now align to `0.17.1`, and vulnerable transitive npm packages in the lockfile were updated so `npm audit --audit-level=high` is clean.
+- **Team startup reliability** — workers avoid redundant MCP startup, idle Ultragoal plans do not trigger accidental Team startup, and draft-only Team startup fails after ready timeout.
+- **HUD/tmux stability** — resize hooks enforce HUD pane height and avoid ownership collisions across windows.
+- **Native session overlays** — user-generated AGENTS guidance is preserved across native session replacement while generated project boilerplate is omitted.
+- **Ralph completion guidance** — examples now require auditable completion evidence before done-state claims.
+
+### PRs
+
+- #2287, #2290, #2292, #2296, #2301, #2303, #2304, #2305, #2306, #2312, #2319
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.17.1.md`.
+
+## [0.17.0] - 2026-05-12
+
+Minor release focused on new coordination and workflow surfaces: bounded Hermes MCP coordination, canonical `$design` workflow guidance, plugin-mode skill marketplace exposure, adversarial UltraQA contracts, Windows native-hook reliability, tmux ownership safety, startup shell isolation, committed project-memory loading, and Ultragoal task-scoped goal reconciliation.
+
+### Added
+
+- **Hermes MCP bridge** — bounded tools for session/status reads, audited follow-up dispatch, safe artifact reads, log tails, session starts, and coordination reports without exposing tmux scrollback or raw private state.
+- **Canonical design workflow** — `DESIGN.md` and mirrored `$design` skill guidance now define the design workflow; `frontend-ui-ux` is deprecated.
+- **Plugin-mode skill discovery** — setup registers and verifies the local Codex plugin marketplace/cache and plugin-scoped MCP metadata, including Hermes.
+
+### Changed
+
+- **UltraQA is adversarial by contract** — guidance now requires hostile scenario modeling, prompt injection attempts, interrupts/cancel/resume, stale state checks, temporary harnesses when useful, and cleanup evidence.
+- **CLI-first runtime authority is clearer** — docs and guidance distinguish CLI-owned runtime behavior from MCP/default setup paths.
+
+### Fixed
+
+- **Windows native hook launch** — PowerShell `ProcessStartInfo` shim preserves stdin/stdout/stderr and exit status across spaces and quoting-sensitive paths.
+- **Tmux continuation ownership** — follow-up injection verifies mode/session/window ownership before sending prompts to panes.
+- **Startup shell isolation** — tmux launches avoid shell rc fan-out before Codex starts.
+- **Ultragoal completion reconciliation** — completed task-scoped aggregate Codex goals can be reconciled to the active OMX story with strict evidence and final quality gates.
+- **Release-review test isolation** — MCP/Hermes state-path tests isolate inherited OMX runtime environment and canonicalize macOS temp roots so symlink-root security checks remain reproducible.
+
+### PRs
+
+- #2267, #2268, #2270, #2272, #2274, #2276, #2283, #2293
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.17.0.md`.
+
+## [0.16.4] - 2026-05-11
+
+Patch release focused on post-`0.16.3` workflow reliability: approved execution handoff integrity, context-pack metadata visibility, Codex hook feature-flag migration, setup/notify ownership safety, HUD/runtime state-root visibility, Ralph completion audit evidence, and Ultragoal completion proof requirements.
+
+### Added
+
+- **Approved context references** — Ralph, Team, and planning handoffs can carry approved context-pack references, private entry metadata, canonical PRD aliases, and ready role refs through the execution lifecycle.
+- **Ralph completion audit guardrails** — Ralph completion now records and checks audit evidence before accepting done-state claims.
+
+### Changed
+
+- **Ultragoal completion proof is stricter** — final cleanup/review proof is required before Ultragoal completion, and docs/skills now make that stop condition explicit.
+- **Skill catalog hygiene** — obsolete catalog entries were pruned and skill guidance was tightened around active OMX runtime surfaces.
+
+### Fixed
+
+- **Codex hook feature flag compatibility** — setup probes `codex features list` and writes the current `[features].hooks = true` flag when supported, while retaining legacy `[features].codex_hooks = true` fallback for older Codex releases and deduping stale aliases during refresh.
+- **Setup, notify, and hook-state ownership** — setup mode switches avoid duplicate hook state, hooks stay active after clear resets, stale PostCompact wiring is detected, and OMX notify dispatch no longer recursively wraps itself.
+- **Approved execution and planning durability** — approved handoffs survive Team scale-up, multiline launch hints, visible hint lineage fallbacks, and context-pack diagnostics/markdown parsing edge cases.
+- **Runtime visibility and cleanup** — HUD visualization stays rooted in OMX runtime authority, plugin-mode skill discovery and plugin MCP cleanup are safer, and boxed Team state-root precedence is corrected.
+
+### PRs
+
+- #2222, #2223, #2224, #2226, #2229, #2241, #2242, #2243, #2245, #2248, #2251, #2256, #2259, #2262, #2263
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.4.md`.
+
+## [0.16.3] - 2026-05-09
+
+Patch release focused on post-`0.16.2` native-hook/setup/runtime hardening: supported Codex hook feature flags, safer notify ownership, runtime hook-trust mirroring, Team startup-evidence state isolation, approved handoff context, planning context-pack references, stale Ralph resume prevention, and native compact-hook JSON validity.
+
+### Added
+
+- **Approved handoff context for Team workers** — workers receive explicit approved handoff context, ready context-pack role references, and preserved launch signatures/hints.
+
+### Changed
+
+- **Codex hook setup uses the supported feature flag** — generated setup/runtime config now emits `[features].hooks = true` and migrates unsupported feature-table aliases back to the supported key.
+- **Runtime state and planning reads are more local by default** — Team startup evidence, planning artifacts, and delivery logs avoid global OMX state contamination unless an explicit Team state root is configured.
+
+### Fixed
+
+- **User hook/notify ownership** — setup and uninstall preserve user-owned notify/hook state, avoid basename-only managed notify matches, and remap project runtime hook trust to the runtime mirror.
+- **Native hook lifecycle correctness** — PreCompact/PostCompact output remains valid JSON, Windows/global install startup self-updates are deferred, and Codex startup exits are surfaced.
+- **Workflow lifecycle reliability** — stale Ralph sessions no longer auto-resume, blocked autoresearch Stop reconciliation is explicit, and Team startup-evidence regressions are covered.
+
+### PRs
+
+- #2186, #2190, #2191, #2196, #2200, #2199, #2201, #2202, #2203, #2204, #2207, #2208, #2212, #2213, #2216, #2217, #2220
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.3.md`.
+
+## [0.16.2] - 2026-05-08
+
+Post-`0.16.1` release-train correction and workflow hardening: aggregate `$ultragoal` Codex goals, commit-shared wiki/compaction support, session-isolated stateful workflows, setup-owned Codex hook trust state, and a release-review correction for generated hook feature flags.
+
+### Added
+
+- **Aggregate `$ultragoal` mode** — new ultragoal plans default to one aggregate Codex objective while OMX records per-story checkpoints; legacy per-story mode remains available for existing/no-mode plans and explicit `--codex-goal-mode per-story`.
+- **Commit-shared project wiki** — canonical wiki storage now lives under repository-root `omx_wiki/`, with native `PreCompact`/`PostCompact` hooks to preserve durable compaction findings.
+- **Setup-owned Codex hook trust state** — setup writes trust records for generated `codex-native-hook.js` wrappers while preserving user hook state.
+
+### Changed
+
+- **Goal-mode handoff guidance** — ultragoal docs, skill/plugin mirrors, planning, ralplan, deep-interview, and planner guidance now recommend `$ultragoal` as the default durable goal-mode follow-up.
+- **Wiki compatibility boundary** — legacy `.omx/wiki/` remains a read-only fallback when canonical `omx_wiki/` is absent.
+
+### Fixed
+
+- **Stateful workflow session isolation** — session-scoped workflow state no longer inherits or autocompletes from root/global workflow entries; explicit `all_sessions` clears remain the global cleanup path.
+- **Codex hook feature-flag regression** — release review restored generated config to `[features].hooks = true`, repairs legacy `[features].codex_hooks = true` aliases, and updates setup/docs/tests/plugin mirrors accordingly.
+- **Release body generation** — `RELEASE_BODY.md` again includes the required contributors anchor for generated GitHub release notes.
+
+### PRs
+
+- #2174, #2188, #2180, #2194, #2193
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.2.md`.
+
+## [0.16.1] - 2026-05-08
+
+Patch release focused on post-`0.16.0` reliability and release-safety hardening: bounded explore execution, safer local explore fast-path reads, clean CI dependency-install proof, session-scoped runtime authority, approved Team handoff repair behavior, context-pack status visibility, deep-interview flow clarity, and launch/runtime fixes.
+
+### Added
+- **Context-pack handoff status visibility** — approved execution paths can expose read-only context-pack readiness/status so follow-up repair behavior is explicit.
+- **Explore fast-path regression coverage** — local explore tests now cover symlink fallback and oversized text-search fallback behavior.
+
+### Changed
+- **CI dependency proof is clean again** — Node CI jobs run `npm ci` unconditionally instead of skipping install on a restored `node_modules` cache.
+- **Team approved handoffs are stricter and more repairable** — selected handoffs, invalid diagnostics, nonready repair-only handling, binding transport, and DAG fallback status stay aligned.
+- **Runtime/session authority is more durable** — session-scoped runtime state, project-scoped Codex goal state, and stale skill-active/HUD cleanup are tightened.
+
+### Fixed
+- **Explore local fast-path boundary hardening** — explicit local file reads reject symlinks before reading, and text search uses bounded reads instead of loading oversized files.
+- **Explore process storm protection** — Codex-backed explore execution has stronger process/output limits before semantic fallback.
+- **Launch/runtime reliability** — Darwin worktree launch assertions, Windows OMX root paths, current JS runtime helpers, plugin skill cache refresh, MCP sibling cleanup, visual Ralph recovery, and native hook background output were hardened.
+
+### Verification
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.1.md`.
+
+## [0.16.0] - 2026-05-06
+
+Minor release focused on skill deprecation and native Codex goal-mode integration. This release prepares durable goal workflows, Codex goal snapshot reconciliation, Team/Ralph goal handoff safety, and catalog/plugin skill delivery cleanup after `0.15.3`.
+
+### Added
+- **Native goal-mode workflows** — `ultragoal`, `performance-goal`, and `autoresearch-goal` provide durable repo artifacts, model-facing Codex goal handoffs, validation ledgers, and completion reconciliation.
+- **Goal workflow validation substrate** — shared helpers record workflow state, ledgers, validation summaries, and fresh Codex goal snapshot checks before accepting completion.
+- **Pipeline package templates and docs** — GitHub package pipeline templates, goal workflow docs, Discord integration docs, and release-readiness evidence are expanded.
+
+### Changed
+- **Ralph and Team goal handoffs are stricter** — completion paths now respect Codex goal-mode truth boundaries and approved execution context.
+- **Explore, notification, and CI paths are hardened** — explore startup bounds, notification proxy handling, question handshakes, boxed state routing, and split CI/package checks improve release reliability.
+
+### Deprecated
+- **Direct `omx autoresearch` launch remains deprecated** — use `$autoresearch` or `omx autoresearch-goal` for goal-mode-backed research workflows.
+
+### Removed
+- **Catalog-deprecated plugin skill delivery** — obsolete skills retired from installable/plugin delivery where catalog-deprecated; deprecated root wrappers may remain as compatibility stubs.
+
+### Fixed
+- **False-completion risk in goal workflows** — completion checkpoints require matching objective/status evidence from fresh Codex goal snapshots.
+- **Runtime lifecycle leaks** — stale Stop handling, MCP sibling cleanup, Ralph session rebinding, boxed state routing, and worker Stop behavior are tightened.
+
+### Verification
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.0.md`; publication remains blocked until local gates and GitHub CI pass.
+
+## [0.15.1] - 2026-04-29
+
+Patch release focused on release-train hardening after `0.15.0`: direct/non-tmux leader launch controls, passive read-only state operations, concrete repo-aware Team DAG dependency remapping, setup/plugin-mode recovery, audited exec follow-ups, and runtime/hook reliability fixes.
+
+### Added
+- **Direct leader launch controls** — `omx --direct` and `OMX_LAUNCH_POLICY=direct|tmux|detached-tmux|auto` let operators opt out of OMX tmux/HUD management without changing the default detached-tmux startup behavior.
+- **Audited exec follow-ups** — running non-interactive `omx exec` jobs can receive queued follow-up instructions through the audited inject path.
+
+### Changed
+- **State reads are passive** — `state_read`, `state_list_active`, and `state_get_status` no longer initialize `.omx/state` or tmux-hook config as a side effect.
+- **Repo-aware Team DAG handoffs use concrete task IDs** — symbolic dependencies are remapped after task creation, then patched onto runtime task records before worker inbox/bootstrap generation.
+- **Setup/plugin guidance is clearer** — setup preserves explicit legacy/plugin choices, archives stale legacy assets in plugin mode, and documents direct launch escape hatches.
+
+### Fixed
+- **Runtime and hook hardening** — Stop lifecycle reads prefer canonical run-state, MCP state persistence survives transport disconnects, prompt resume avoids unverified PID hard failures, source-log text no longer trips hook blocks, and macOS startup polling pressure is reduced.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, plugin manifest, changelog, release body, release notes, and release-readiness collateral are aligned to `0.15.1`.
+
+## [0.15.0] - 2026-04-25
+
+Minor release focused on making OMX easier to install, ship, and operate across Codex CLI, Codex App, plugin, native-agent, tmux, and Rust-backed execution surfaces. This release prepares the plugin delivery train, Visual Ralph, setup install-mode selection, native agent/model routing, hook/runtime hardening, Windows/tmux question reliability, CI hang protection, Rust compatibility fixes, and release collateral for the `0.15.0` cut.
+
+### Added
+- **First-party Codex plugin packaging** — OMX now ships a mirrored `plugins/oh-my-codex` bundle, plugin marketplace metadata, Codex App compatibility descriptors, plugin bundle SSOT checks, and install-mode setup coverage.
+- **Visual Ralph workflow** — `visual-ralph` is now a first-class workflow skill with routing, metadata validation, generated docs, and regression coverage.
+- **Native-agent policy/model routing** — native subagent definitions, model table generation, and setup overwrite tests now preserve the `gpt-5.5` frontier, `gpt-5.4-mini` standard, and `gpt-5.3-codex-spark` fast-lane contract.
+- **Document refresh enforcement and first-party MCP surfaces** — setup/config paths now include the new refresh-enforcer and first-party MCP configuration coverage.
+
+### Changed
+- **Setup can choose plugin or legacy skill delivery** — project setup now preserves persisted install mode, reports plugin cleanup/backups, keeps managed hooks/runtime assets aligned, and makes next steps clearer for Codex App and CLI users.
+- **Plugin and generated assets are checked from one source of truth** — native-agent verification, plugin mirror sync, generated catalog docs, and package bin/layout tests now guard release packaging drift.
+- **Team/runtime prompts are more explicit about safe execution** — worker, team, Ralph, doctor, help, and setup guidance now better describe plugin mode, runtime ownership, and action-first execution boundaries.
+- **Release base handling is explicit** — `v0.14.4` exists but is not an ancestor of the current `dev` candidate; this release uses `v0.14.3` as the verified reachable compare base and records that range caveat in release collateral.
+
+### Fixed
+- **Codex App and plugin hook compatibility** — App sessions avoid tmux-only runtime paths, plugin-prefixed skills route correctly, scoped plugin content stays aligned with canonical sources, and setup avoids overwriting local ignore state.
+- **Windows/tmux question reliability** — Windows/non-attached question rendering and console behavior have stronger fallbacks and regression coverage.
+- **Hook and watcher hardening** — notification fallback watchers, derived watchers, stale tmux sockets, Stop-hook parseability, and setup plugin fixes are covered by targeted regressions.
+- **CI and Rust compatibility** — Node test execution has bounded silence handling, and the explore harness remains compatible with Cargo/Rust 1.73-era constraints.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, changelog, release body, release notes, and release-readiness collateral are aligned to `0.15.0`.
+
+## [0.14.4] - 2026-04-24
+
+Patch release focused on promoting the default frontier lane from `gpt-5.4` to `gpt-5.5` while preserving the exact `gpt-5.4-mini` standard/mini seam and the `gpt-5.3-codex-spark` spark lane. Docs, setup/config guidance, templates, regression coverage, and release metadata are aligned to that contract.
+
+### Changed
+- **Frontier defaults now target `gpt-5.5`** — runtime defaults, Codex agent defaults, and `omx explore` fallback behavior now use `gpt-5.5` instead of `gpt-5.4`.
+- **Setup/config guidance matches the new frontier default** — config seeding docs and regression coverage now describe `gpt-5.5` while preserving the same `250000 / 200000` context recommendations.
+- **Setup and executor reasoning default to medium** — generated setup config and executor worker launch defaults now use medium reasoning instead of high.
+- **Mini and spark lanes remain exact** — `gpt-5.4-mini` and `gpt-5.3-codex-spark` behavior remains unchanged, with prompt guidance and tests still enforcing exact-match semantics.
+
+### Fixed
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, changelog, release body, release notes, and release-readiness collateral are aligned to `0.14.4`.
+
+## [0.14.3] - 2026-04-22
+
+Patch release focused on the latest `dev` hardening train after `0.14.2`: question/deep-interview return-pane reliability, project-local explore launch context, setup TOML repair safety, HUD reconcile window targeting, ultrawork protocol alignment, BusyBox cleanup compatibility, stale Stop/autopilot state handling, canonical runtime supervisor events, Docker-host tmux question rendering, and native Windows psmux worker pane bootstrap hardening.
+
+### Added
+- **Canonical supervisor runtime events** — runtime command-event contracts now include canonical event types for supervisor control and downstream dispatch/readiness decisions.
+- **Deep-interview summary gates** — oversized interview flows now require compact summaries before continuing.
+- **Docker-host tmux question bridge** — question rendering can bridge docker-host tmux detection for visible operator prompts.
+
+### Changed
+- **Question replies preserve the leader pane** — tool-launched `omx question` flows retain and reuse the correct return pane across prompt reseeding and renderer metadata races.
+- **Explore respects project-local Codex homes** — launch/session helpers honor persisted project setup scope by resolving `CODEX_HOME` to the project `.codex` directory when appropriate.
+- **Setup config repair is safer** — multiline root TOML strings are parsed as root entries so setup refreshes no longer orphan fragments or corrupt `developer_instructions`-style values.
+- **HUD reconciliation stays window-local** — hook-driven HUD resize/reconcile work targets the emitting tmux window.
+- **Ultrawork protocol stays aligned upstream** — the shipped ultrawork skill incorporates the upstream protocol refresh used by oh-my-openagent.
+- **Native Windows worker panes are more robust** — psmux worker bootstrap avoids stale pane/startup assumptions.
+
+### Fixed
+- **Answered deep-interview rounds no longer re-prompt** — stale question state is reconciled against answered records before enforcement asks again.
+- **Question answers no longer stall on renderer metadata races** — renderer return-target metadata is stabilized so answers can be injected back to the invoking pane.
+- **Detached/hidden question prompts remain operator-visible** — question rendering fails closed or bridges to visible tmux contexts instead of leaving prompts hidden from the operator.
+- **BusyBox cleanup compatibility** — cleanup retries process discovery with the BusyBox-compatible `args` field when `ps` rejects `command`.
+- **Native Stop no longer loops on stale autopilot planning state** — stale planning state is cleared/reconciled before Stop handling repeats.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, changelog, release body, release notes, and release-readiness collateral are aligned to `0.14.3`.
+
+## [0.14.2] - 2026-04-21
+
+Patch release focused on fast-follow operator reliability after `0.14.1`: safer `omx question` renderer behavior outside attached tmux panes, leak-resistant MCP duplicate cleanup, tighter deep-interview session-state handling, Korean IME drift handling for the `ulw` ultrawork shorthand, shared tmux answer-submit semantics for `omx question`, clearer deep-interview background-question guidance, TypeScript/Biome baseline refresh, and release collateral alignment.
+
+### Added
+- **Korean `ulw` keyboard drift handling** — prompts typed as `ㅕㅣㅈ` on a Korean 2-set keyboard normalize to the existing `ulw` ultrawork shorthand before workflow activation.
+- **Background `omx question` guidance** — deep-interview skill/template/native-hook guidance now instructs agents to wait for background question terminals to finish and read the JSON answer before continuing.
+
+### Changed
+- **Question answer injection now reuses shared tmux submit semantics** — `src/question/renderer.ts` delegates to `buildSendPaneArgvs`, keeping literal text delivery, newline sanitization, and isolated `C-m` submits aligned with the reply-listener pane-send path.
+- **Question renderer now fails closed outside attached tmux** — `omx question` now refuses to create a detached tmux session when no visible attached pane exists, surfacing a clear operator-facing error instead of launching an unseen renderer.
+- **Deep-interview keyword intent is narrower** — cleanup/state-management mentions of “deep interview” no longer trigger the workflow unless activation intent is explicit.
+- **TypeScript baseline refreshed** — TypeScript is updated to `6.0.3`, Biome lockfile metadata is refreshed to `2.4.12`, and `tsconfig.json` pins Node ambient types for the TS 6 build path.
+
+### Fixed
+- **Stale duplicate MCP siblings** — older duplicate stdio servers now self-exit after a safe post-traffic idle window instead of lingering indefinitely after seeing traffic.
+- **Session-scoped clear fallback leaks** — clearing a tracked mode in an active session now writes an inactive session tombstone when needed so legacy root fallback state does not immediately report the mode active again.
+- **Failed question launches clear deep-interview obligations** — deep-interview no longer leaves a pending question obligation behind when the renderer cannot launch.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, changelog, release body, release notes, and release-readiness collateral are aligned to `0.14.2`.
+
+## [0.14.1] - 2026-04-21
+
+Patch release focused on hardening the new interactive orchestration surfaces shipped in `0.14.0`: question-pane reliability across tmux environments, deep-interview Stop enforcement and reused-session bridging, setup/update refresh resilience, lifecycle contract deduplication, and code-review / lightweight fallback guidance polish.
+
+### Added
+- **Deep-interview bridge guidance for reused sessions** — prompt-side context now includes a concrete current-session CLI bridge command when bare `omx question` is unavailable.
+- **Detached question renderer liveness coverage** — regression tests now assert that detached tmux question sessions survive launch and fail closed when they disappear immediately.
+
+### Changed
+- **Code-review workflow guidance is stronger** — the shipped code-review skill now requires a more comprehensive, dual-perspective review posture.
+- **Lightweight native fallback lanes are leaner** — `omx explore` / `omx sparkshell` fallback guidance stays on mini/spark lanes without polluting the general role roster.
+- **Lifecycle normalization now delegates to the shared contract** — terminal lifecycle compatibility helpers reuse the centralized run-outcome contract instead of carrying a divergent copy.
+
+### Fixed
+- **Pending deep-interview questions now keep Stop blocked even after the mode marks itself inactive**.
+- **Question panes stay alive under non-POSIX tmux shells and fail closed when panes/sessions disappear during launch**.
+- **Accepted setup refreshes no longer destroy managed `AGENTS.md`, and postinstall/setup refresh stays rooted to npm's install prefix**.
+- **Explicit `omx update` now reruns setup refresh when the installed code is current but the setup stamp is stale, and update-check state write failures no longer block explicit updates**.
+- **Stale Ralph / skill-active / ultrawork Stop state no longer leaks across sessions or floods Stop handling**.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, changelog, release body, release notes, and release-readiness collateral are aligned to `0.14.1`.
+
 ## [0.14.0] - 2026-04-19
 
 Minor release centered on interactive orchestration changes: the new `omx question` blocking-question entrypoint, deep-interview and autoresearch flow tightening, advisory triage routing, explicit runtime run outcomes, specialist-routing cleanup, and release-proof hardening for the shipped package.
@@ -699,7 +1125,7 @@ Generated from the latest merged `dev` runtime/model-default work and validated 
 
 ### Added
 - **Additive team event-query APIs** — `omx team api` now exposes dedicated event-query operations so team runtime signals can be consumed more structurally. (PR [#714](https://github.com/Yeachan-Heo/oh-my-codex/pull/714))
-- **Explicit model-default contract** — runtime/docs/tests now align around the intended main/spark default model behavior (`gpt-5.4` / `gpt-5.3-codex-spark`). (PR [#718](https://github.com/Yeachan-Heo/oh-my-codex/pull/718))
+- **Explicit model-default contract** — runtime/docs/tests now align around the intended main/spark default model behavior (`gpt-5.5` / `gpt-5.3-codex-spark`). (PR [#718](https://github.com/Yeachan-Heo/oh-my-codex/pull/718))
 
 ### Changed
 - **Team prompt decomposition is less brittle for prose prompts** — natural-language task prompts are no longer fragmented into pathological subtasks as easily. (PR [#712](https://github.com/Yeachan-Heo/oh-my-codex/pull/712))
@@ -808,7 +1234,7 @@ Generated from `v0.8.3..dev` (non-merge commits) and release validation on `dev`
 - Setup refresh coverage for managed artifact replacement, scope-aware updates, and uninstall compatibility paths.
 
 ### Fixed
-- Setup now prompts before upgrading managed Codex model references from `gpt-5.3-codex` to `gpt-5.4`, reducing surprise config churn during refreshes.
+- Setup now prompts before upgrading managed Codex model references from `gpt-5.3-codex` to `gpt-5.5`, reducing surprise config churn during refreshes.
 - Config generation and setup refresh flows are more idempotent and resilient across repeated runs and scoped installs.
 
 ### Docs
@@ -839,7 +1265,7 @@ Generated from `v0.8.1..main` (non-merge commits) and release validation on `mai
 
 ### Added
 - Gemini CLI worker support for OMX team mode, including mixed CLI maps and `--model` passthrough (`#576`, `#579`, related issue `#573`).
-- Default frontier-model fallback is now centralized through `DEFAULT_FRONTIER_MODEL` (currently `gpt-5.4`) instead of hardcoded references (`#583`).
+- Default frontier-model fallback is now centralized through `DEFAULT_FRONTIER_MODEL` (currently `gpt-5.5`) instead of hardcoded references (`#583`).
 - `configure-notifications` is now the canonical shipped notification-setup skill, with catalog/setup behavior aligned to match docs (`#584`).
 
 ### Changed

@@ -20,7 +20,7 @@ export interface AgentDefinition {
 const EXECUTOR_AGENT: AgentDefinition = {
   name: 'executor',
   description: 'Code implementation, refactoring, feature work',
-  reasoningEffort: 'high',
+  reasoningEffort: 'medium',
   posture: 'deep-worker',
   modelClass: 'standard',
   routingRole: 'executor',
@@ -311,6 +311,38 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   },
 
   // Coordination
+
+  'prometheus-strict-metis': {
+    name: 'prometheus-strict-metis',
+    description: 'Prometheus Strict requirements interviewer and ambiguity mapper',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-momus': {
+    name: 'prometheus-strict-momus',
+    description: 'Prometheus Strict adversarial plan critic and risk challenger',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-oracle': {
+    name: 'prometheus-strict-oracle',
+    description: 'Prometheus Strict implementation readiness verifier and handoff judge',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'standard',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',

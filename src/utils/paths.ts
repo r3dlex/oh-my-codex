@@ -18,6 +18,23 @@ export function codexHome(): string {
 export const OMX_ENTRY_PATH_ENV = "OMX_ENTRY_PATH";
 export const OMX_STARTUP_CWD_ENV = "OMX_STARTUP_CWD";
 
+function resolveOmxRootCandidate(raw?: string): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  return isAbsolute(trimmed) ? trimmed : resolve(trimmed);
+}
+
+/** Optional override root for OMX runtime files. */
+export function omxRoot(projectRoot?: string): string {
+  const override =
+    resolveOmxRootCandidate(process.env.OMX_ROOT)
+    ?? resolveOmxRootCandidate(process.env.OMX_STATE_ROOT);
+  if (override) return join(override, ".omx");
+  return join(projectRoot || process.cwd(), ".omx");
+}
+
+
 function resolveLauncherPath(rawPath: string, baseCwd: string): string {
   const absolutePath = isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath);
   if (!existsSync(absolutePath)) return absolutePath;
@@ -53,11 +70,18 @@ export function resolveOmxEntryPath(
     env?: NodeJS.ProcessEnv;
   } = {},
 ): string | null {
-  const { argv1 = process.argv[1], cwd = process.cwd(), env = process.env } = options;
+  const { cwd = process.cwd(), env = process.env } = options;
+  const hasExplicitArgv1 = Object.prototype.hasOwnProperty.call(options, "argv1");
+  const argv1 = hasExplicitArgv1 ? options.argv1 : process.argv[1];
+  const rawPath = typeof argv1 === "string" ? argv1.trim() : "";
+  if (hasExplicitArgv1 && rawPath !== "") {
+    const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? "").trim() || cwd;
+    return resolveLauncherPath(rawPath, startupCwd);
+  }
+
   const fromEnv = String(env[OMX_ENTRY_PATH_ENV] ?? "").trim();
   if (fromEnv !== "") return fromEnv;
 
-  const rawPath = typeof argv1 === "string" ? argv1.trim() : "";
   if (rawPath === "") return null;
 
   const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? "").trim() || cwd;
@@ -99,11 +123,16 @@ export function rememberOmxLaunchContext(
   }
   if (String(env[OMX_ENTRY_PATH_ENV] ?? "").trim() !== "") return;
 
-  const resolved = resolveOmxEntryPath({
-    argv1: options.argv1,
-    cwd,
-    env,
-  });
+  const resolved = Object.prototype.hasOwnProperty.call(options, "argv1")
+    ? resolveOmxEntryPath({
+      argv1: options.argv1,
+      cwd,
+      env,
+    })
+    : resolveOmxEntryPath({
+      cwd,
+      env,
+    });
   if (resolved) {
     env[OMX_ENTRY_PATH_ENV] = resolved;
   }
@@ -273,37 +302,67 @@ async function hashSkillDirectory(
 
 /** oh-my-codex state directory (.omx/state/) */
 export function omxStateDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "state");
+  return join(omxRoot(projectRoot), "state");
 }
 
 /** oh-my-codex project memory file (.omx/project-memory.json) */
 export function omxProjectMemoryPath(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "project-memory.json");
+  return join(omxRoot(projectRoot), "project-memory.json");
+}
+
+/** Repository-visible project memory file used as canonical startup context. */
+export function canonicalProjectMemoryPath(projectRoot?: string): string {
+  return join(projectRoot || process.cwd(), "project-memory.json");
+}
+
+/** Project memory read order: repository-visible canonical file, then legacy OMX runtime memory. */
+export function projectMemoryPathCandidates(projectRoot?: string): string[] {
+  const canonical = canonicalProjectMemoryPath(projectRoot);
+  const legacy = omxProjectMemoryPath(projectRoot);
+  return canonical === legacy ? [canonical] : [canonical, legacy];
+}
+
+/** First readable project memory path, preferring repository-visible canonical memory. */
+export function resolveProjectMemoryPath(projectRoot?: string): string | null {
+  for (const path of projectMemoryPathCandidates(projectRoot)) {
+    if (existsSync(path)) return path;
+  }
+  return null;
 }
 
 /** oh-my-codex notepad file (.omx/notepad.md) */
 export function omxNotepadPath(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "notepad.md");
+  return join(omxRoot(projectRoot), "notepad.md");
 }
 
-/** oh-my-codex wiki directory (.omx/wiki/) */
+/** oh-my-codex wiki directory (repository-root omx_wiki/) */
 export function omxWikiDir(projectRoot?: string): string {
+  return join(projectRoot || process.cwd(), "omx_wiki");
+}
+
+/** Legacy project-local wiki directory used before wiki pages became repository-tracked. */
+export function omxLegacyWikiDir(projectRoot?: string): string {
   return join(projectRoot || process.cwd(), ".omx", "wiki");
 }
 
 /** oh-my-codex plans directory (.omx/plans/) */
 export function omxPlansDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "plans");
+  return join(omxRoot(projectRoot), "plans");
 }
 
 /** oh-my-codex adapters directory (.omx/adapters/) */
 export function omxAdaptersDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "adapters");
+  return join(omxRoot(projectRoot), "adapters");
 }
 
 /** oh-my-codex logs directory (.omx/logs/) */
 export function omxLogsDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "logs");
+  return join(omxRoot(projectRoot), "logs");
+}
+
+/** User-scope install/update stamp path ($CODEX_HOME/.omx/install-state.json) */
+export function omxUserInstallStampPath(codexHomeDir?: string): string {
+  return join(codexHomeDir || codexHome(), ".omx", "install-state.json");
 }
 
 /** Get the package root directory (where agents/, skills/, prompts/ live) */

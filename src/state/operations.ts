@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
   getAllScopedStatePaths,
+  getAuthoritativeActiveStateDirs,
+  getBaseStateDir,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
   getStateDir,
@@ -14,6 +16,7 @@ import {
   validateSessionId,
   validateStateModeSegment,
 } from '../mcp/state-paths.js';
+import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
@@ -21,7 +24,7 @@ import {
   SKILL_ACTIVE_STATE_MODE,
   readSkillActiveState,
   syncCanonicalSkillStateForMode,
-  writeSkillActiveStateCopies,
+  writeSkillActiveStateCopiesForStateDir,
 } from './skill-active.js';
 import { isTrackedWorkflowMode } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
@@ -35,6 +38,7 @@ export const SUPPORTED_STATE_READ_MODES = [
   'ultraqa',
   'ralplan',
   'deep-interview',
+  'skill-active',
 ] as const;
 
 export type SupportedStateReadMode = (typeof SUPPORTED_STATE_READ_MODES)[number];
@@ -83,6 +87,23 @@ async function writeAtomicFile(path: string, data: string): Promise<void> {
   }
 }
 
+async function writeClearedSessionScopedModeState(
+  path: string,
+  mode: string,
+  sessionId: string,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  const clearedState = withModeRuntimeContext({}, {
+    mode,
+    active: false,
+    current_phase: 'cleared',
+    updated_at: nowIso,
+    completed_at: nowIso,
+    session_id: sessionId,
+  });
+  await writeAtomicFile(path, JSON.stringify(clearedState, null, 2));
+}
+
 function readModeSupportsStrictValidation(mode: string): mode is SupportedStateReadMode {
   return SUPPORTED_STATE_READ_MODES.includes(mode as SupportedStateReadMode);
 }
@@ -104,22 +125,27 @@ async function initializeStateEnvironment(cwd: string, effectiveSessionId?: stri
   await ensureTmuxHookInitialized(cwd);
 }
 
-async function listStateSessionIds(cwd: string): Promise<string[]> {
-  const sessionsDir = join(getStateDir(cwd), 'sessions');
-  if (!existsSync(sessionsDir)) return [];
-  const entries = await readdir(sessionsDir, { withFileTypes: true }).catch(() => []);
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .filter((entry) => entry.trim().length > 0);
+function hasExplicitStateField(
+  fields: Record<string, unknown>,
+  customState: unknown,
+  key: string,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(fields, key)
+    || (
+      customState != null
+      && Object.prototype.hasOwnProperty.call(customState as Record<string, unknown>, key)
+    );
 }
 
 export async function listStateStatuses(
   cwd: string,
   explicitSessionId?: string,
   mode?: string,
+  options: { authoritativeActiveDecision?: boolean } = {},
 ): Promise<Record<string, unknown>> {
-  const stateDirs = await getReadScopedStateDirs(cwd, explicitSessionId);
+  const stateDirs = options.authoritativeActiveDecision
+    ? await getAuthoritativeActiveStateDirs(cwd, explicitSessionId)
+    : await getReadScopedStateDirs(cwd, explicitSessionId);
   const statuses: Record<string, unknown> = {};
   const seenModes = new Set<string>();
 
@@ -157,7 +183,9 @@ export async function listActiveStateModes(
 ): Promise<string[]> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
   const sessionId = validateSessionId(explicitSessionId);
-  const statuses = await listStateStatuses(cwd, sessionId);
+  const statuses = await listStateStatuses(cwd, sessionId, undefined, {
+    authoritativeActiveDecision: true,
+  });
   return Object.entries(statuses)
     .filter(([, status]) => Boolean((status as { active?: unknown }).active))
     .map(([mode]) => mode);
@@ -181,10 +209,6 @@ export async function executeStateOperation(
   }
 
   try {
-    const stateScope = await resolveStateScope(cwd, explicitSessionId);
-    const effectiveSessionId = stateScope.sessionId;
-    await initializeStateEnvironment(cwd, effectiveSessionId);
-
     switch (name) {
       case 'state_read': {
         const mode = validateStrictReadableMode(rawArgs.mode);
@@ -198,7 +222,12 @@ export async function executeStateOperation(
       }
 
       case 'state_write': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
+        const baseStateDir = getBaseStateDir(cwd);
         const path = getStatePath(mode, cwd, effectiveSessionId);
         const {
           mode: _mode,
@@ -226,13 +255,14 @@ export async function executeStateOperation(
             ...fields,
             ...((customState as Record<string, unknown>) || {}),
           } as Record<string, unknown>;
-          const explicitRunOutcome = Object.prototype.hasOwnProperty.call(fields, 'run_outcome')
-            || (
-              customState != null
-              && Object.prototype.hasOwnProperty.call(customState as Record<string, unknown>, 'run_outcome')
-            );
-          if (!explicitRunOutcome) {
+          if (!hasExplicitStateField(fields, customState, 'run_outcome')) {
             delete mergedRaw.run_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'lifecycle_outcome')) {
+            delete mergedRaw.lifecycle_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'terminal_outcome')) {
+            delete mergedRaw.terminal_outcome;
           }
 
           if (
@@ -258,6 +288,16 @@ export async function executeStateOperation(
               validation.state.ralph_phase_normalized_from = originalPhase;
             }
             Object.assign(mergedRaw, validation.state);
+            if (mergedRaw.current_phase === 'complete') {
+              const completionAudit = evaluateRalphCompletionAuditEvidence(mergedRaw, cwd);
+              if (!completionAudit.complete) {
+                validationError = `ralph complete state requires passing completion_audit or repo-relative completion_audit_path (${completionAudit.reason})`;
+                return;
+              }
+              delete mergedRaw.completion_audit_gate;
+              delete mergedRaw.completion_audit_missing_reason;
+              delete mergedRaw.completion_audit_blocked_at;
+            }
             ensureRalphArtifacts = true;
           }
 
@@ -272,21 +312,11 @@ export async function executeStateOperation(
 
           if (isTrackedWorkflowMode(mode) && mergedRaw.active === true) {
             try {
-              if (!effectiveSessionId) {
-                for (const sessionId of await listStateSessionIds(cwd)) {
-                  const sessionTransition = await reconcileWorkflowTransition(cwd, mode, {
-                    action: 'write',
-                    sessionId,
-                    source: 'state-operations',
-                  });
-                  transitionMessage ??= sessionTransition.transitionMessage;
-                }
-              }
-
               const transition = await reconcileWorkflowTransition(cwd, mode, {
                 action: 'write',
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
+                baseStateDir,
               });
               transitionMessage ??= transition.transitionMessage;
             } catch (error) {
@@ -309,7 +339,7 @@ export async function executeStateOperation(
         if (mode === SKILL_ACTIVE_STATE_MODE) {
           const state = await readSkillActiveState(path);
           if (state) {
-            await writeSkillActiveStateCopies(cwd, state, effectiveSessionId);
+            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
           }
         } else {
           if (mode === 'ralph' && ensureRalphArtifacts) {
@@ -318,6 +348,7 @@ export async function executeStateOperation(
           const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
           await syncCanonicalSkillStateForMode({
             cwd,
+            baseStateDir,
             mode,
             active: data.active === true,
             currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
@@ -337,17 +368,29 @@ export async function executeStateOperation(
       }
 
       case 'state_clear': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
+        const baseStateDir = getBaseStateDir(cwd);
         const allSessions = rawArgs.all_sessions === true;
 
         if (!allSessions) {
           const path = getStatePath(mode, cwd, effectiveSessionId);
-          if (existsSync(path)) {
+          if (
+            mode !== SKILL_ACTIVE_STATE_MODE
+            && effectiveSessionId
+            && existsSync(getStatePath(mode, cwd))
+          ) {
+            await writeClearedSessionScopedModeState(path, mode, effectiveSessionId);
+          } else if (existsSync(path)) {
             await unlink(path);
           }
           if (mode !== SKILL_ACTIVE_STATE_MODE) {
             await syncCanonicalSkillStateForMode({
               cwd,
+              baseStateDir,
               mode,
               active: false,
               sessionId: effectiveSessionId,
@@ -367,9 +410,11 @@ export async function executeStateOperation(
         if (mode !== SKILL_ACTIVE_STATE_MODE) {
           await syncCanonicalSkillStateForMode({
             cwd,
+            baseStateDir,
             mode,
             active: false,
             source: 'state-operations',
+            allSessions: true,
           });
         }
 

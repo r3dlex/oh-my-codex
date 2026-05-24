@@ -75,6 +75,15 @@ export function resolveCurrentTag(cwd: string, explicit?: string): string {
   throw new Error('unable to determine current release tag; pass --current-tag or set GITHUB_REF_NAME');
 }
 
+function isAncestorTag(cwd: string, possibleAncestor: string, currentTag: string): boolean {
+  const result = spawnSync('git', ['merge-base', '--is-ancestor', possibleAncestor, currentTag], {
+    cwd,
+    encoding: 'utf-8',
+    stdio: 'pipe',
+  });
+  return result.status === 0;
+}
+
 export function resolvePreviousTag(cwd: string, currentTag: string, explicit?: string): string | undefined {
   if (explicit) return explicit;
   const tags = runGit(['tag', '--list', 'v*', '--sort=-v:refname'], cwd, true)
@@ -83,8 +92,30 @@ export function resolvePreviousTag(cwd: string, currentTag: string, explicit?: s
     .filter(Boolean);
   if (tags.length === 0) return undefined;
   const currentIndex = tags.indexOf(currentTag);
-  if (currentIndex >= 0) return tags.slice(currentIndex + 1).find(Boolean);
-  return tags.find((tag) => tag !== currentTag);
+  const candidates = currentIndex >= 0
+    ? tags.slice(currentIndex + 1)
+    : tags.filter((tag) => tag !== currentTag);
+  return candidates.find((tag) => isAncestorTag(cwd, tag, currentTag));
+}
+
+function verifyGitCommitRef(cwd: string, ref: string, label: string): void {
+  if (!runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd, true)) {
+    throw new Error(`unable to verify ${label} ref for release compare: ${ref}`);
+  }
+}
+
+export function verifyCompareRange(cwd: string, currentTag: string, previousTag?: string): void {
+  if (!previousTag) return;
+  verifyGitCommitRef(cwd, previousTag, 'previous tag');
+  verifyGitCommitRef(cwd, currentTag, 'current tag');
+  const mergeBase = spawnSync('git', ['merge-base', '--is-ancestor', previousTag, currentTag], {
+    cwd,
+    encoding: 'utf-8',
+    stdio: 'pipe',
+  });
+  if (mergeBase.status !== 0) {
+    throw new Error(`invalid release compare range: ${previousTag} is not an ancestor of ${currentTag}`);
+  }
 }
 
 function normalizeContributors(contributors: Contributor[]): Contributor[] {
@@ -256,6 +287,7 @@ export async function generateReleaseBody(options: GenerateReleaseBodyOptions): 
   const outPath = resolve(cwd, options.outPath);
   const currentTag = resolveCurrentTag(cwd, options.currentTag);
   const previousTag = resolvePreviousTag(cwd, currentTag, options.previousTag);
+  verifyCompareRange(cwd, currentTag, previousTag);
   const repo = options.repo || process.env.GITHUB_REPOSITORY || resolveRepositoryFromRemote(cwd);
   const contributors = await resolveContributors({
     cwd,

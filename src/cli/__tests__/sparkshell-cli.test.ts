@@ -14,6 +14,7 @@ import {
   packagedSparkShellBinaryCandidatePaths,
   parseSparkShellFallbackInvocation,
   repoLocalSparkShellBinaryPath,
+  resolveFallbackShellArgv,
   resolveSparkShellBinaryPath,
   resolveSparkShellBinaryPathWithHydration,
   runSparkShellBinary,
@@ -300,7 +301,9 @@ describe('runSparkShellBinary', () => {
     await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
       env: {
         OMX_DEFAULT_FRONTIER_MODEL: 'frontier-local',
+        OMX_DEFAULT_STANDARD_MODEL: 'standard-local',
         OMX_DEFAULT_SPARK_MODEL: 'spark-local',
+        OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE: '/config/sparkshell-instructions.md',
       },
     }));
 
@@ -326,10 +329,36 @@ describe('runSparkShellBinary', () => {
       });
 
       assert.equal(invokedEnv?.OMX_DEFAULT_FRONTIER_MODEL, 'frontier-shell');
+      assert.equal(invokedEnv?.OMX_DEFAULT_STANDARD_MODEL, 'standard-local');
       assert.equal(invokedEnv?.OMX_DEFAULT_SPARK_MODEL, 'spark-local');
+      assert.equal(invokedEnv?.OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE, '/config/sparkshell-instructions.md');
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
+  });
+
+  it('defaults to packaged lightweight instructions outside the role prompts directory', () => {
+    let invokedEnv: NodeJS.ProcessEnv | undefined;
+    runSparkShellBinary('/fake/omx-sparkshell', ['git', 'status'], {
+      cwd: '/tmp/example',
+      env: {},
+      spawnImpl: ((_: string, __: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+        invokedEnv = options.env;
+        return {
+          pid: 1,
+          output: [],
+          stdout: null,
+          stderr: null,
+          status: 0,
+          signal: null,
+        };
+      }) as unknown as typeof spawnSync,
+    });
+
+    assert.match(
+      invokedEnv?.OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE || '',
+      /templates[\\/]+model-instructions[\\/]+sparkshell-lightweight-AGENTS\.md$/,
+    );
   });
 });
 
@@ -368,6 +397,44 @@ describe('parseSparkShellFallbackInvocation', () => {
     assert.deepEqual(
       parseSparkShellFallbackInvocation(['git', 'log', '--oneline']),
       { kind: 'command', argv: ['git', 'log', '--oneline'] },
+    );
+  });
+
+  it('translates explicit shell fallback through sh -lc', () => {
+    assert.deepEqual(
+      parseSparkShellFallbackInvocation(['--shell', 'printf ok']),
+      { kind: 'command', argv: ['sh', '-lc', 'printf ok'] },
+    );
+  });
+
+  it('translates explicit shell fallback through pwsh on Windows when available', () => {
+    assert.deepEqual(
+      parseSparkShellFallbackInvocation(['--shell', 'Write-Output ok'], {
+        platform: 'win32',
+        commandExists: (command) => command === 'pwsh',
+      }),
+      { kind: 'command', argv: ['pwsh', '-NoLogo', '-NoProfile', '-Command', 'Write-Output ok'] },
+    );
+  });
+
+  it('falls back from pwsh to powershell.exe on Windows', () => {
+    assert.deepEqual(
+      resolveFallbackShellArgv('Write-Output ok', {
+        platform: 'win32',
+        commandExists: (command) => command === 'powershell.exe',
+      }),
+      ['powershell.exe', '-NoLogo', '-NoProfile', '-Command', 'Write-Output ok'],
+    );
+  });
+
+  it('uses minimal cmd fallback for explicit shell fallback on Windows', () => {
+    assert.deepEqual(
+      resolveFallbackShellArgv('echo ok', {
+        platform: 'win32',
+        env: {},
+        commandExists: () => false,
+      }),
+      ['cmd.exe', '/d', '/s', '/c', 'echo ok'],
     );
   });
 
@@ -413,6 +480,8 @@ describe('omx sparkshell', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.match(result.stdout, /Usage: omx sparkshell <command> \[args\.\.\.\]/);
       assert.match(result.stdout, /or: omx sparkshell --tmux-pane <pane-id> \[--tail-lines <100-1000>\]/);
+      assert.match(result.stdout, /OMX_SPARKSHELL_BIN overrides the native binary/);
+      assert.match(result.stdout, /OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE overrides packaged summary instructions/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

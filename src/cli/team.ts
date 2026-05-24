@@ -1,15 +1,20 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
-import { getStatePath, validateSessionId } from '../mcp/state-paths.js';
+import { getStateFilePath, getStatePath, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
+import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
 import { sanitizeTeamName } from '../team/tmux-session.js';
 import { readTeamEvents, waitForTeamEvent } from '../team/state/events.js';
 import type { TeamEvent } from '../team/state.js';
 import { parseWorktreeMode, type WorktreeMode } from '../team/worktree.js';
 import { classifyTaskSize } from '../hooks/task-size-detector.js';
-import { readApprovedExecutionLaunchHint } from '../planning/artifacts.js';
+import {
+  readApprovedExecutionLaunchHintOutcome,
+  type ApprovedExecutionLaunchHint,
+  type ApprovedRepositoryContextSummary,
+} from '../planning/artifacts.js';
 import { routeTaskToRole } from '../team/role-router.js';
 import { allocateTasksToWorkers } from '../team/allocation-policy.js';
 import {
@@ -24,8 +29,20 @@ import {
   type TeamApiOperation,
 } from '../team/api-interop.js';
 import { teamReadConfig as readTeamConfig, teamReadPhase as readTeamPhase } from '../team/team-ops.js';
+import { resolveTeamNameForCurrentContext } from '../team/team-identity.js';
 import { recordLeaderRuntimeActivity } from '../team/leader-activity.js';
 import { readTeamPaneStatus } from '../team/pane-status.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  resolvePersistedApprovedTeamExecutionContinuityStateSync,
+  type ApprovedTeamExecutionBinding,
+} from '../team/approved-execution.js';
+import {
+  buildUltragoalCheckpointGuidance,
+  readPersistedTeamUltragoalContext,
+  renderUltragoalCheckpointGuidanceText,
+} from '../team/ultragoal-context.js';
+import { resolveCodexHomeForLaunch } from './codex-home.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -38,8 +55,12 @@ interface ParsedTeamArgs {
   explicitWorkerCount: boolean;
   task: string;
   teamName: string;
+  displayName?: string;
+  allowRepoAwareDagHandoff: boolean;
+  dagFallbackReason?: string;
+  approvedRepositoryContextSummary?: ApprovedRepositoryContextSummary;
+  approvedExecution?: ApprovedTeamExecutionBinding;
 }
-
 
 interface TeamFollowupContext {
   task: string;
@@ -47,6 +68,7 @@ interface TeamFollowupContext {
   explicitWorkerCount: boolean;
   agentType?: string;
   explicitAgentType?: boolean;
+  approvedHint?: ApprovedExecutionLaunchHint;
 }
 
 function persistExactTeamModeState(
@@ -67,6 +89,9 @@ function persistExactTeamModeState(
 }
 
 function readPersistedTeamFollowupState(cwd: string): {
+  active?: boolean;
+  team_name?: string;
+  team_state_root?: string;
   task?: string;
   task_description?: string;
   workerCount?: number;
@@ -75,51 +100,144 @@ function readPersistedTeamFollowupState(cwd: string): {
   agent_types?: string;
   linkedRalph?: boolean;
 } | null {
-  const path = join(cwd, '.omx', 'state', 'team-state.json');
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8')) as {
-      task?: string;
-      workerCount?: number;
-      agentType?: string;
-      linkedRalph?: boolean;
-      task_description?: string;
-      agent_count?: number;
-      agent_types?: string;
-    };
-  } catch {
-    return null;
+  const readState = (path: string) => {
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, 'utf-8')) as {
+        active?: boolean;
+        team_name?: string;
+        team_state_root?: string;
+        task?: string;
+        workerCount?: number;
+        agentType?: string;
+        linkedRalph?: boolean;
+        task_description?: string;
+        agent_count?: number;
+        agent_types?: string;
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const isActiveTeamState = (state: {
+    active?: boolean;
+    team_name?: string;
+  } | null): state is {
+    active: true;
+    team_name: string;
+    team_state_root?: string;
+    task?: string;
+    task_description?: string;
+    workerCount?: number;
+    agent_count?: number;
+    agentType?: string;
+    agent_types?: string;
+    linkedRalph?: boolean;
+  } => state?.active === true && typeof state.team_name === 'string' && state.team_name.trim() !== '';
+
+  const sessionStatePath = getStateFilePath('session.json', cwd);
+  let scopedSessionId: string | undefined;
+  if (existsSync(sessionStatePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(sessionStatePath, 'utf-8')) as { session_id?: unknown };
+      scopedSessionId = validateSessionId(parsed.session_id);
+    } catch {
+      // Best-effort state lookup only.
+    }
   }
+
+  if (scopedSessionId) {
+    const scopedState = readState(getStatePath('team', cwd, scopedSessionId));
+    if (isActiveTeamState(scopedState)) {
+      return scopedState;
+    }
+  }
+
+  const path = getStatePath('team', cwd);
+  if (!existsSync(path)) return null;
+  const state = readState(path);
+  return isActiveTeamState(state) ? state : null;
 }
 
 function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFollowupContext | null {
   const normalizedTask = task.trim();
   if (!normalizedTask) return null;
 
-  const existingTeamState = readPersistedTeamFollowupState(cwd);
   const shortFollowup = ['team', 'team으로 해줘', 'team으로 해주세요'].includes(normalizedTask);
   if (!shortFollowup) return null;
 
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team');
-  if (!approvedHint) return null;
-
+  const existingTeamState = readPersistedTeamFollowupState(cwd);
+  const persistedTeamName = typeof existingTeamState?.team_name === 'string'
+    ? existingTeamState.team_name.trim()
+    : '';
+  const persistedTeamStateRoot = typeof existingTeamState?.team_state_root === 'string'
+    && existingTeamState.team_state_root.trim() !== ''
+    ? existingTeamState.team_state_root.trim()
+    : undefined;
   const persistedTask = typeof existingTeamState?.task_description === 'string'
-    ? existingTeamState.task_description
+    ? existingTeamState.task_description.trim()
     : typeof existingTeamState?.task === 'string'
-      ? existingTeamState.task
-      : null;
+      ? existingTeamState.task.trim()
+      : '';
   const persistedWorkerCount = typeof existingTeamState?.agent_count === 'number'
     ? existingTeamState.agent_count
     : typeof existingTeamState?.workerCount === 'number'
       ? existingTeamState.workerCount
       : null;
-  if (persistedTask && persistedWorkerCount && persistedTask.trim() === approvedHint.task.trim()) {
+  const persistedAgentType = typeof existingTeamState?.agentType === 'string'
+    && existingTeamState.agentType.trim() !== ''
+    ? existingTeamState.agentType.trim()
+    : undefined;
+  const persistedLinkedRalph = typeof existingTeamState?.linkedRalph === 'boolean'
+    ? existingTeamState.linkedRalph
+    : undefined;
+  let approvedHint: ApprovedExecutionLaunchHint | null = null;
+
+  if (persistedTeamName !== '') {
+    const continuity = resolvePersistedApprovedTeamExecutionContinuityStateSync(
+      persistedTeamName,
+      cwd,
+      persistedTeamStateRoot,
+    );
+    if (continuity.status === 'malformed') {
+      throw new Error(`approved_execution_binding_malformed:${persistedTeamName}`);
+    }
+    if (continuity.status === 'ambiguous') {
+      throw new Error(
+        `approved_execution_binding_ambiguous:${continuity.binding.prd_path}:${continuity.binding.task}`,
+      );
+    }
+    if (continuity.status === 'stale') {
+      throw new Error(`approved_execution_binding_stale:${continuity.binding.prd_path}:${continuity.binding.task}`);
+    }
+    if (continuity.status === 'valid') {
+      approvedHint = continuity.approvedHint;
+    }
+  }
+
+  if (!approvedHint) {
+    const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      ...(persistedTask !== '' ? { task: persistedTask } : {}),
+      ...(persistedWorkerCount != null ? { workerCount: persistedWorkerCount } : {}),
+      ...(persistedAgentType ? { agentType: persistedAgentType } : {}),
+      ...(persistedLinkedRalph != null ? { linkedRalph: persistedLinkedRalph } : {}),
+    });
+    if (approvedHintOutcome.status === 'ambiguous') {
+      throw new Error('approved_execution_hint_ambiguous:team');
+    }
+    if (approvedHintOutcome.status !== 'resolved') return null;
+    approvedHint = approvedHintOutcome.hint;
+  }
+
+  if (persistedTask !== '' && persistedWorkerCount && persistedTask === approvedHint.task.trim()) {
     return {
       task: persistedTask,
       workerCount: persistedWorkerCount,
       explicitWorkerCount: true,
       agentType: approvedHint.agentType,
       explicitAgentType: approvedHint.agentType != null,
+      approvedHint,
     };
   }
 
@@ -129,7 +247,25 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
     explicitWorkerCount: approvedHint.workerCount != null,
     agentType: approvedHint.agentType,
     explicitAgentType: approvedHint.agentType != null,
+    approvedHint,
   };
+}
+
+function buildExplicitOmxTeamLaunchCommand(
+  task: string,
+  workerCount: number,
+  explicitWorkerCount: boolean,
+  agentType: string,
+  explicitAgentType: boolean,
+): string | null {
+  if (!explicitWorkerCount) {
+    return null;
+  }
+
+  const countToken = explicitAgentType
+    ? `${workerCount}:${agentType}`
+    : String(workerCount);
+  return `omx team ${countToken} ${JSON.stringify(task)}`;
 }
 
 const MIN_WORKER_COUNT = 1;
@@ -143,7 +279,7 @@ function isTerminalModePhase(phase: string): boolean {
 
 const TEAM_HELP = `
 Usage: omx team [N:agent-type] "<task description>"
-       omx team status <team-name> [--json] [--tail-lines <100-1000>]
+       omx team status <team-name> [--json] [--tail-lines <100-1000>] [--model-inspect]
        omx team await <team-name> [--timeout-ms <ms>] [--after-event-id <id>] [--json]
        omx team resume <team-name>
        omx team shutdown <team-name> [--force] [--confirm-issues]
@@ -153,13 +289,15 @@ Usage: omx team [N:agent-type] "<task description>"
 Notes:
   team workers use dedicated worktrees automatically by default.
   --worktree is deprecated for omx team and is now only a backward-compatible no-op override.
+  omx team is a tmux-runtime surface by default; in Codex App or plain outside-tmux sessions, launch OMX CLI from shell first instead of treating team as directly available.
   use native Codex subagents for small in-session fanout; use omx team for durable tmux/state/worktree coordination.
+  repo-aware DAG handoff is opt-in: Team only imports a DAG when the invocation matches the latest approved PRD/test-spec launch hint (or a short approved follow-up like \`omx team team\`).
 
 Examples:
   omx team 3:executor "fix failing tests"
   omx team status my-team
   omx team status my-team --json
-  omx team status my-team --tail-lines 600
+  omx team status my-team --model-inspect --tail-lines 600
   omx team api send-message --input '{"team_name":"my-team","from_worker":"worker-1","to_worker":"leader-fixed","body":"ACK"}' --json
 `;
 
@@ -173,6 +311,10 @@ Supported operations:
 Examples:
   omx team api list-tasks --input '{"team_name":"my-team"}' --json
   omx team api claim-task --input '{"team_name":"my-team","task_id":"1","worker":"worker-1","expected_version":1}' --json
+
+Safety:
+  team status prints raw tmux capture commands by default so inspect hints do not spend Spark/model quota.
+  pass --model-inspect to print omx sparkshell summary commands intentionally.
 `;
 
 const HELP_TOKENS = new Set(['--help', '-h', 'help']);
@@ -355,6 +497,14 @@ function parseStatusTailLines(args: string[]): number {
   return DEFAULT_SPARKSHELL_TAIL_LINES;
 }
 
+function parseStatusModelInspect(args: string[]): boolean {
+  return args.includes('--model-inspect');
+}
+
+function rawTmuxCaptureCommand(paneId: string, tailLines: number): string {
+  return `tmux capture-pane -p -t ${paneId} -S -${tailLines}`;
+}
+
 export interface ParsedTeamStartArgs {
   parsed: ParsedTeamArgs;
   worktreeMode: WorktreeMode;
@@ -445,8 +595,196 @@ function buildDeadWorkerAwaitEvent(teamName: string, snapshot: TeamSnapshot): Te
 }
 
 
+type TeamPaneStatus = Awaited<ReturnType<typeof readTeamPaneStatus>>;
+type TeamInspectItem = TeamPaneStatus['recommended_inspect_items'][number];
+
+function logInspectEntries<T>(
+  prefix: string,
+  entries: Record<string, T>,
+  shouldLog: (value: T) => boolean,
+  formatValue: (value: T) => string = (value) => String(value),
+): void {
+  for (const [target, value] of Object.entries(entries)) {
+    if (shouldLog(value)) {
+      console.log(`${prefix}_${target}: ${formatValue(value)}`);
+    }
+  }
+}
+
+type InspectEntryDescriptor<T> = {
+  prefix: string;
+  entries: Record<string, T>;
+  shouldLog: (value: T) => boolean;
+  formatValue?: (value: T) => string;
+};
+
+function logInspectEntryDescriptors(descriptors: InspectEntryDescriptor<unknown>[]): void {
+  for (const descriptor of descriptors) {
+    logInspectEntries(descriptor.prefix, descriptor.entries, descriptor.shouldLog, descriptor.formatValue);
+  }
+}
+
+function inspectEntryDescriptors(paneStatus: TeamPaneStatus): InspectEntryDescriptor<unknown>[] {
+  const isPresentString = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+  const isNumber = (value: unknown): value is number => typeof value === 'number';
+  const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
+  const hasItems = (value: unknown): value is string[] => Array.isArray(value) && value.length > 0;
+  const joinSpace = (value: unknown): string => Array.isArray(value) ? value.join(' ') : String(value);
+
+  return [
+    { prefix: 'inspect_reason', entries: paneStatus.recommended_inspect_reasons, shouldLog: isPresentString },
+    { prefix: 'inspect_cli', entries: paneStatus.recommended_inspect_clis, shouldLog: isPresentString },
+    { prefix: 'inspect_role', entries: paneStatus.recommended_inspect_roles, shouldLog: isPresentString },
+    { prefix: 'inspect_index', entries: paneStatus.recommended_inspect_indexes, shouldLog: isNumber },
+    { prefix: 'inspect_alive', entries: paneStatus.recommended_inspect_alive, shouldLog: isBoolean },
+    { prefix: 'inspect_turn_count', entries: paneStatus.recommended_inspect_turn_counts, shouldLog: isNumber },
+    { prefix: 'inspect_turns_without_progress', entries: paneStatus.recommended_inspect_turns_without_progress, shouldLog: isNumber },
+    { prefix: 'inspect_last_turn_at', entries: paneStatus.recommended_inspect_last_turn_at, shouldLog: isPresentString },
+    { prefix: 'inspect_status_updated_at', entries: paneStatus.recommended_inspect_status_updated_at, shouldLog: isPresentString },
+    { prefix: 'inspect_pid', entries: paneStatus.recommended_inspect_pids, shouldLog: isNumber },
+    { prefix: 'inspect_worktree_path', entries: paneStatus.recommended_inspect_worktree_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worktree_repo_root', entries: paneStatus.recommended_inspect_worktree_repo_roots, shouldLog: isPresentString },
+    { prefix: 'inspect_worktree_branch', entries: paneStatus.recommended_inspect_worktree_branches, shouldLog: isPresentString },
+    { prefix: 'inspect_worktree_detached', entries: paneStatus.recommended_inspect_worktree_detached, shouldLog: isBoolean },
+    { prefix: 'inspect_worktree_created', entries: paneStatus.recommended_inspect_worktree_created, shouldLog: isBoolean },
+    { prefix: 'inspect_team_state_root', entries: paneStatus.recommended_inspect_team_state_roots, shouldLog: isPresentString },
+    { prefix: 'inspect_workdir', entries: paneStatus.recommended_inspect_workdirs, shouldLog: isPresentString },
+    { prefix: 'inspect_assigned_tasks', entries: paneStatus.recommended_inspect_assigned_tasks, shouldLog: hasItems, formatValue: joinSpace },
+    { prefix: 'inspect_task_status', entries: paneStatus.recommended_inspect_task_statuses, shouldLog: isPresentString },
+    { prefix: 'inspect_task_result', entries: paneStatus.recommended_inspect_task_results, shouldLog: isPresentString },
+    { prefix: 'inspect_task_error', entries: paneStatus.recommended_inspect_task_errors, shouldLog: isPresentString },
+    { prefix: 'inspect_task_version', entries: paneStatus.recommended_inspect_task_versions, shouldLog: isNumber },
+    { prefix: 'inspect_task_created_at', entries: paneStatus.recommended_inspect_task_created_at, shouldLog: isPresentString },
+    { prefix: 'inspect_task_completed_at', entries: paneStatus.recommended_inspect_task_completed_at, shouldLog: isPresentString },
+    { prefix: 'inspect_task_depends_on', entries: paneStatus.recommended_inspect_task_depends_on, shouldLog: hasItems, formatValue: joinSpace },
+    { prefix: 'inspect_task_claim_present', entries: paneStatus.recommended_inspect_task_claim_present, shouldLog: isBoolean },
+    { prefix: 'inspect_task_claim_owner', entries: paneStatus.recommended_inspect_task_claim_owners, shouldLog: isPresentString },
+    { prefix: 'inspect_task_claim_token', entries: paneStatus.recommended_inspect_task_claim_tokens, shouldLog: isPresentString },
+    { prefix: 'inspect_task_claim_leased_until', entries: paneStatus.recommended_inspect_task_claim_leases, shouldLog: isPresentString },
+    { prefix: 'inspect_task_claim_lock_path', entries: paneStatus.recommended_inspect_task_claim_lock_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_required', entries: paneStatus.recommended_inspect_approval_required, shouldLog: isBoolean },
+    { prefix: 'inspect_requires_code_change', entries: paneStatus.recommended_inspect_requires_code_change, shouldLog: isBoolean },
+    { prefix: 'inspect_description', entries: paneStatus.recommended_inspect_descriptions, shouldLog: isPresentString },
+    { prefix: 'inspect_blocked_by', entries: paneStatus.recommended_inspect_blocked_by, shouldLog: hasItems, formatValue: joinSpace },
+    { prefix: 'inspect_task_role', entries: paneStatus.recommended_inspect_task_roles, shouldLog: isPresentString },
+    { prefix: 'inspect_task_owner', entries: paneStatus.recommended_inspect_task_owners, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_status', entries: paneStatus.recommended_inspect_approval_statuses, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_reviewer', entries: paneStatus.recommended_inspect_approval_reviewers, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_reason', entries: paneStatus.recommended_inspect_approval_reasons, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_decided_at', entries: paneStatus.recommended_inspect_approval_decided_at, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_record_present', entries: paneStatus.recommended_inspect_approval_record_present, shouldLog: isBoolean },
+    { prefix: 'inspect_state', entries: paneStatus.recommended_inspect_states, shouldLog: isPresentString },
+    { prefix: 'inspect_state_reason', entries: paneStatus.recommended_inspect_state_reasons, shouldLog: isPresentString },
+    { prefix: 'inspect_task', entries: paneStatus.recommended_inspect_tasks, shouldLog: isPresentString },
+    { prefix: 'inspect_subject', entries: paneStatus.recommended_inspect_subjects, shouldLog: isPresentString },
+    { prefix: 'inspect_task_path', entries: paneStatus.recommended_inspect_task_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_approval_path', entries: paneStatus.recommended_inspect_approval_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_state_dir', entries: paneStatus.recommended_inspect_worker_state_dirs, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_status_path', entries: paneStatus.recommended_inspect_worker_status_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_heartbeat_path', entries: paneStatus.recommended_inspect_worker_heartbeat_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_identity_path', entries: paneStatus.recommended_inspect_worker_identity_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_inbox_path', entries: paneStatus.recommended_inspect_worker_inbox_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_mailbox_path', entries: paneStatus.recommended_inspect_worker_mailbox_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_shutdown_request_path', entries: paneStatus.recommended_inspect_worker_shutdown_request_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_worker_shutdown_ack_path', entries: paneStatus.recommended_inspect_worker_shutdown_ack_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_dir_path', entries: paneStatus.recommended_inspect_team_dir_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_config_path', entries: paneStatus.recommended_inspect_team_config_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_manifest_path', entries: paneStatus.recommended_inspect_team_manifest_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_events_path', entries: paneStatus.recommended_inspect_team_events_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_dispatch_path', entries: paneStatus.recommended_inspect_team_dispatch_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_phase_path', entries: paneStatus.recommended_inspect_team_phase_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_monitor_snapshot_path', entries: paneStatus.recommended_inspect_team_monitor_snapshot_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_team_summary_snapshot_path', entries: paneStatus.recommended_inspect_team_summary_snapshot_paths, shouldLog: isPresentString },
+    { prefix: 'inspect_pane', entries: paneStatus.recommended_inspect_panes, shouldLog: isPresentString },
+  ];
+}
+
+function formatInspectItemLine(index: number, item: TeamInspectItem, modelInspect = false, tailLines = DEFAULT_SPARKSHELL_TAIL_LINES): string {
+  const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
+  const parts = [
+    `inspect_item_${index + 1}:`,
+    `target=${item.target}`,
+    item.pane_id ? `pane=${item.pane_id}` : '',
+    item.worker_cli ? `cli=${item.worker_cli}` : '',
+    item.role ? `role=${item.role}` : '',
+    typeof item.index === 'number' ? `index=${item.index}` : '',
+    typeof item.alive === 'boolean' ? `alive=${item.alive}` : '',
+    typeof item.turn_count === 'number' ? `turn_count=${item.turn_count}` : '',
+    typeof item.turns_without_progress === 'number' ? `turns_without_progress=${item.turns_without_progress}` : '',
+    item.last_turn_at ? `last_turn_at=${item.last_turn_at}` : '',
+    item.status_updated_at ? `status_updated_at=${item.status_updated_at}` : '',
+    typeof item.pid === 'number' ? `pid=${item.pid}` : '',
+    item.worktree_repo_root ? `worktree_repo_root=${item.worktree_repo_root}` : '',
+    item.worktree_path ? `worktree_path=${item.worktree_path}` : '',
+    item.worktree_branch ? `worktree_branch=${item.worktree_branch}` : '',
+    typeof item.worktree_detached === 'boolean' ? `worktree_detached=${item.worktree_detached}` : '',
+    typeof item.worktree_created === 'boolean' ? `worktree_created=${item.worktree_created}` : '',
+    item.team_state_root ? `team_state_root=${item.team_state_root}` : '',
+    item.working_dir ? `workdir=${item.working_dir}` : '',
+    item.assigned_tasks.length > 0 ? `assigned_tasks=${item.assigned_tasks.join(',')}` : '',
+    item.task_status ? `task_status=${item.task_status}` : '',
+    item.task_result ? `task_result=${item.task_result}` : '',
+    item.task_error ? `task_error=${item.task_error}` : '',
+    typeof item.task_version === 'number' ? `task_version=${item.task_version}` : '',
+    item.task_created_at ? `task_created_at=${item.task_created_at}` : '',
+    item.task_completed_at ? `task_completed_at=${item.task_completed_at}` : '',
+    item.task_depends_on.length > 0 ? `task_depends_on=${item.task_depends_on.join(',')}` : '',
+    typeof item.task_claim_present === 'boolean' ? `task_claim_present=${item.task_claim_present}` : '',
+    item.task_claim_owner ? `task_claim_owner=${item.task_claim_owner}` : '',
+    item.task_claim_token ? `task_claim_token=${item.task_claim_token}` : '',
+    item.task_claim_leased_until ? `task_claim_leased_until=${item.task_claim_leased_until}` : '',
+    item.task_claim_lock_path ? `task_claim_lock_path=${item.task_claim_lock_path}` : '',
+    typeof item.approval_required === 'boolean' ? `approval_required=${item.approval_required}` : '',
+    typeof item.requires_code_change === 'boolean' ? `requires_code_change=${item.requires_code_change}` : '',
+    item.task_description ? `description=${item.task_description}` : '',
+    item.blocked_by.length > 0 ? `blocked_by=${item.blocked_by.join(',')}` : '',
+    item.task_role ? `task_role=${item.task_role}` : '',
+    item.task_owner ? `task_owner=${item.task_owner}` : '',
+    item.approval_status ? `approval_status=${item.approval_status}` : '',
+    item.approval_reviewer ? `approval_reviewer=${item.approval_reviewer}` : '',
+    item.approval_reason ? `approval_reason=${item.approval_reason}` : '',
+    item.approval_decided_at ? `approval_decided_at=${item.approval_decided_at}` : '',
+    typeof item.approval_record_present === 'boolean' ? `approval_record_present=${item.approval_record_present}` : '',
+    item.state_reason ? `state_reason=${item.state_reason}` : '',
+    item.task_id ? `task=${item.task_id}` : '',
+    item.task_subject ? `subject=${item.task_subject}` : '',
+    item.task_path ? `task_path=${item.task_path}` : '',
+    item.approval_path ? `approval_path=${item.approval_path}` : '',
+    item.worker_state_dir ? `worker_state_dir=${item.worker_state_dir}` : '',
+    item.worker_status_path ? `worker_status_path=${item.worker_status_path}` : '',
+    item.worker_heartbeat_path ? `worker_heartbeat_path=${item.worker_heartbeat_path}` : '',
+    item.worker_identity_path ? `worker_identity_path=${item.worker_identity_path}` : '',
+    item.worker_inbox_path ? `worker_inbox_path=${item.worker_inbox_path}` : '',
+    item.worker_mailbox_path ? `worker_mailbox_path=${item.worker_mailbox_path}` : '',
+    item.worker_shutdown_request_path ? `worker_shutdown_request_path=${item.worker_shutdown_request_path}` : '',
+    item.worker_shutdown_ack_path ? `worker_shutdown_ack_path=${item.worker_shutdown_ack_path}` : '',
+    item.team_dir_path ? `team_dir_path=${item.team_dir_path}` : '',
+    item.team_config_path ? `team_config_path=${item.team_config_path}` : '',
+    item.team_manifest_path ? `team_manifest_path=${item.team_manifest_path}` : '',
+    item.team_events_path ? `team_events_path=${item.team_events_path}` : '',
+    item.team_dispatch_path ? `team_dispatch_path=${item.team_dispatch_path}` : '',
+    item.team_phase_path ? `team_phase_path=${item.team_phase_path}` : '',
+    item.team_monitor_snapshot_path ? `team_monitor_snapshot_path=${item.team_monitor_snapshot_path}` : '',
+    item.team_summary_snapshot_path ? `team_summary_snapshot_path=${item.team_summary_snapshot_path}` : '',
+    `reason=${item.reason}`,
+    item.state ? `state=${item.state}` : '',
+    `command=${command}`,
+  ];
+  return parts.filter(Boolean).join(' ');
+}
+
+function renderInspectSummary(summary: string, command: string | null): string {
+  if (!command) return summary;
+  if (/(^| )command=/.test(summary)) {
+    return summary.replace(/(^| )command=.*$/, `$1command=${command}`);
+  }
+  return `${summary} command=${command}`;
+}
+
 function renderTeamPaneStatus(
-  paneStatus: Awaited<ReturnType<typeof readTeamPaneStatus>>,
+  paneStatus: TeamPaneStatus,
+  modelInspect = false,
+  tailLines = DEFAULT_SPARKSHELL_TAIL_LINES,
 ): void {
   if (paneStatus.leader_pane_id || paneStatus.hud_pane_id) {
     console.log(`panes: leader=${paneStatus.leader_pane_id || '-'} hud=${paneStatus.hud_pane_id || '-'}`);
@@ -458,424 +796,50 @@ function renderTeamPaneStatus(
   }
 
   if (paneStatus.sparkshell_hint) {
-    console.log('sparkshell_hint: omx sparkshell --tmux-pane <pane-id> --tail-lines 400');
+    console.log('inspect_hint: raw tmux capture commands are quota-free; rerun status with --model-inspect for omx sparkshell summaries');
   }
 
   if (paneStatus.recommended_inspect_targets.length > 0) {
     console.log(`recommended_inspect_targets: ${paneStatus.recommended_inspect_targets.join(' ')}`);
   }
-  for (const [target, reason] of Object.entries(paneStatus.recommended_inspect_reasons)) {
-    console.log(`inspect_reason_${target}: ${reason}`);
-  }
-  for (const [target, workerCli] of Object.entries(paneStatus.recommended_inspect_clis)) {
-    if (workerCli) {
-      console.log(`inspect_cli_${target}: ${workerCli}`);
-    }
-  }
-  for (const [target, role] of Object.entries(paneStatus.recommended_inspect_roles)) {
-    if (role) {
-      console.log(`inspect_role_${target}: ${role}`);
-    }
-  }
-  for (const [target, index] of Object.entries(paneStatus.recommended_inspect_indexes)) {
-    if (typeof index === 'number') {
-      console.log(`inspect_index_${target}: ${index}`);
-    }
-  }
-  for (const [target, alive] of Object.entries(paneStatus.recommended_inspect_alive)) {
-    if (typeof alive === 'boolean') {
-      console.log(`inspect_alive_${target}: ${alive}`);
-    }
-  }
-  for (const [target, turnCount] of Object.entries(paneStatus.recommended_inspect_turn_counts)) {
-    if (typeof turnCount === 'number') {
-      console.log(`inspect_turn_count_${target}: ${turnCount}`);
-    }
-  }
-  for (const [target, turnsWithoutProgress] of Object.entries(paneStatus.recommended_inspect_turns_without_progress)) {
-    if (typeof turnsWithoutProgress === 'number') {
-      console.log(`inspect_turns_without_progress_${target}: ${turnsWithoutProgress}`);
-    }
-  }
-  for (const [target, lastTurnAt] of Object.entries(paneStatus.recommended_inspect_last_turn_at)) {
-    if (lastTurnAt) {
-      console.log(`inspect_last_turn_at_${target}: ${lastTurnAt}`);
-    }
-  }
-  for (const [target, statusUpdatedAt] of Object.entries(paneStatus.recommended_inspect_status_updated_at)) {
-    if (statusUpdatedAt) {
-      console.log(`inspect_status_updated_at_${target}: ${statusUpdatedAt}`);
-    }
-  }
-  for (const [target, pid] of Object.entries(paneStatus.recommended_inspect_pids)) {
-    if (typeof pid === 'number') {
-      console.log(`inspect_pid_${target}: ${pid}`);
-    }
-  }
-  for (const [target, worktreePath] of Object.entries(paneStatus.recommended_inspect_worktree_paths)) {
-    if (worktreePath) {
-      console.log(`inspect_worktree_path_${target}: ${worktreePath}`);
-    }
-  }
-  for (const [target, worktreeRepoRoot] of Object.entries(paneStatus.recommended_inspect_worktree_repo_roots)) {
-    if (worktreeRepoRoot) {
-      console.log(`inspect_worktree_repo_root_${target}: ${worktreeRepoRoot}`);
-    }
-  }
-  for (const [target, worktreeBranch] of Object.entries(paneStatus.recommended_inspect_worktree_branches)) {
-    if (worktreeBranch) {
-      console.log(`inspect_worktree_branch_${target}: ${worktreeBranch}`);
-    }
-  }
-  for (const [target, worktreeDetached] of Object.entries(paneStatus.recommended_inspect_worktree_detached)) {
-    if (typeof worktreeDetached === 'boolean') {
-      console.log(`inspect_worktree_detached_${target}: ${worktreeDetached}`);
-    }
-  }
-  for (const [target, worktreeCreated] of Object.entries(paneStatus.recommended_inspect_worktree_created)) {
-    if (typeof worktreeCreated === 'boolean') {
-      console.log(`inspect_worktree_created_${target}: ${worktreeCreated}`);
-    }
-  }
-  for (const [target, teamStateRoot] of Object.entries(paneStatus.recommended_inspect_team_state_roots)) {
-    if (teamStateRoot) {
-      console.log(`inspect_team_state_root_${target}: ${teamStateRoot}`);
-    }
-  }
-  for (const [target, workdir] of Object.entries(paneStatus.recommended_inspect_workdirs)) {
-    if (workdir) {
-      console.log(`inspect_workdir_${target}: ${workdir}`);
-    }
-  }
-  for (const [target, assignedTasks] of Object.entries(paneStatus.recommended_inspect_assigned_tasks)) {
-    if (assignedTasks.length > 0) {
-      console.log(`inspect_assigned_tasks_${target}: ${assignedTasks.join(' ')}`);
-    }
-  }
-  for (const [target, taskStatus] of Object.entries(paneStatus.recommended_inspect_task_statuses)) {
-    if (taskStatus) {
-      console.log(`inspect_task_status_${target}: ${taskStatus}`);
-    }
-  }
-  for (const [target, taskResult] of Object.entries(paneStatus.recommended_inspect_task_results)) {
-    if (taskResult) {
-      console.log(`inspect_task_result_${target}: ${taskResult}`);
-    }
-  }
-  for (const [target, taskError] of Object.entries(paneStatus.recommended_inspect_task_errors)) {
-    if (taskError) {
-      console.log(`inspect_task_error_${target}: ${taskError}`);
-    }
-  }
-  for (const [target, taskVersion] of Object.entries(paneStatus.recommended_inspect_task_versions)) {
-    if (typeof taskVersion === 'number') {
-      console.log(`inspect_task_version_${target}: ${taskVersion}`);
-    }
-  }
-  for (const [target, taskCreatedAt] of Object.entries(paneStatus.recommended_inspect_task_created_at)) {
-    if (taskCreatedAt) {
-      console.log(`inspect_task_created_at_${target}: ${taskCreatedAt}`);
-    }
-  }
-  for (const [target, taskCompletedAt] of Object.entries(paneStatus.recommended_inspect_task_completed_at)) {
-    if (taskCompletedAt) {
-      console.log(`inspect_task_completed_at_${target}: ${taskCompletedAt}`);
-    }
-  }
-  for (const [target, taskDependsOn] of Object.entries(paneStatus.recommended_inspect_task_depends_on)) {
-    if (taskDependsOn.length > 0) {
-      console.log(`inspect_task_depends_on_${target}: ${taskDependsOn.join(' ')}`);
-    }
-  }
-  for (const [target, taskClaimPresent] of Object.entries(paneStatus.recommended_inspect_task_claim_present)) {
-    if (typeof taskClaimPresent === 'boolean') {
-      console.log(`inspect_task_claim_present_${target}: ${taskClaimPresent}`);
-    }
-  }
-  for (const [target, taskClaimOwner] of Object.entries(paneStatus.recommended_inspect_task_claim_owners)) {
-    if (taskClaimOwner) {
-      console.log(`inspect_task_claim_owner_${target}: ${taskClaimOwner}`);
-    }
-  }
-  for (const [target, taskClaimToken] of Object.entries(paneStatus.recommended_inspect_task_claim_tokens)) {
-    if (taskClaimToken) {
-      console.log(`inspect_task_claim_token_${target}: ${taskClaimToken}`);
-    }
-  }
-  for (const [target, taskClaimLease] of Object.entries(paneStatus.recommended_inspect_task_claim_leases)) {
-    if (taskClaimLease) {
-      console.log(`inspect_task_claim_leased_until_${target}: ${taskClaimLease}`);
-    }
-  }
-  for (const [target, taskClaimLockPath] of Object.entries(paneStatus.recommended_inspect_task_claim_lock_paths)) {
-    if (taskClaimLockPath) {
-      console.log(`inspect_task_claim_lock_path_${target}: ${taskClaimLockPath}`);
-    }
-  }
-  for (const [target, approvalRequired] of Object.entries(paneStatus.recommended_inspect_approval_required)) {
-    if (typeof approvalRequired === 'boolean') {
-      console.log(`inspect_approval_required_${target}: ${approvalRequired}`);
-    }
-  }
-  for (const [target, requiresCodeChange] of Object.entries(paneStatus.recommended_inspect_requires_code_change)) {
-    if (typeof requiresCodeChange === 'boolean') {
-      console.log(`inspect_requires_code_change_${target}: ${requiresCodeChange}`);
-    }
-  }
-  for (const [target, description] of Object.entries(paneStatus.recommended_inspect_descriptions)) {
-    if (description) {
-      console.log(`inspect_description_${target}: ${description}`);
-    }
-  }
-  for (const [target, blockedBy] of Object.entries(paneStatus.recommended_inspect_blocked_by)) {
-    if (blockedBy.length > 0) {
-      console.log(`inspect_blocked_by_${target}: ${blockedBy.join(' ')}`);
-    }
-  }
-  for (const [target, taskRole] of Object.entries(paneStatus.recommended_inspect_task_roles)) {
-    if (taskRole) {
-      console.log(`inspect_task_role_${target}: ${taskRole}`);
-    }
-  }
-  for (const [target, taskOwner] of Object.entries(paneStatus.recommended_inspect_task_owners)) {
-    if (taskOwner) {
-      console.log(`inspect_task_owner_${target}: ${taskOwner}`);
-    }
-  }
-  for (const [target, approvalStatus] of Object.entries(paneStatus.recommended_inspect_approval_statuses)) {
-    if (approvalStatus) {
-      console.log(`inspect_approval_status_${target}: ${approvalStatus}`);
-    }
-  }
-  for (const [target, approvalReviewer] of Object.entries(paneStatus.recommended_inspect_approval_reviewers)) {
-    if (approvalReviewer) {
-      console.log(`inspect_approval_reviewer_${target}: ${approvalReviewer}`);
-    }
-  }
-  for (const [target, approvalReason] of Object.entries(paneStatus.recommended_inspect_approval_reasons)) {
-    if (approvalReason) {
-      console.log(`inspect_approval_reason_${target}: ${approvalReason}`);
-    }
-  }
-  for (const [target, approvalDecidedAt] of Object.entries(paneStatus.recommended_inspect_approval_decided_at)) {
-    if (approvalDecidedAt) {
-      console.log(`inspect_approval_decided_at_${target}: ${approvalDecidedAt}`);
-    }
-  }
-  for (const [target, approvalRecordPresent] of Object.entries(paneStatus.recommended_inspect_approval_record_present)) {
-    if (typeof approvalRecordPresent === 'boolean') {
-      console.log(`inspect_approval_record_present_${target}: ${approvalRecordPresent}`);
-    }
-  }
-  for (const [target, state] of Object.entries(paneStatus.recommended_inspect_states)) {
-    if (state) {
-      console.log(`inspect_state_${target}: ${state}`);
-    }
-  }
-  for (const [target, stateReason] of Object.entries(paneStatus.recommended_inspect_state_reasons)) {
-    if (stateReason) {
-      console.log(`inspect_state_reason_${target}: ${stateReason}`);
-    }
-  }
-  for (const [target, taskId] of Object.entries(paneStatus.recommended_inspect_tasks)) {
-    if (taskId) {
-      console.log(`inspect_task_${target}: ${taskId}`);
-    }
-  }
-  for (const [target, subject] of Object.entries(paneStatus.recommended_inspect_subjects)) {
-    if (subject) {
-      console.log(`inspect_subject_${target}: ${subject}`);
-    }
-  }
-  for (const [target, taskPath] of Object.entries(paneStatus.recommended_inspect_task_paths)) {
-    if (taskPath) {
-      console.log(`inspect_task_path_${target}: ${taskPath}`);
-    }
-  }
-  for (const [target, approvalPath] of Object.entries(paneStatus.recommended_inspect_approval_paths)) {
-    if (approvalPath) {
-      console.log(`inspect_approval_path_${target}: ${approvalPath}`);
-    }
-  }
-  for (const [target, workerStateDir] of Object.entries(paneStatus.recommended_inspect_worker_state_dirs)) {
-    if (workerStateDir) {
-      console.log(`inspect_worker_state_dir_${target}: ${workerStateDir}`);
-    }
-  }
-  for (const [target, workerStatusPath] of Object.entries(paneStatus.recommended_inspect_worker_status_paths)) {
-    if (workerStatusPath) {
-      console.log(`inspect_worker_status_path_${target}: ${workerStatusPath}`);
-    }
-  }
-  for (const [target, workerHeartbeatPath] of Object.entries(paneStatus.recommended_inspect_worker_heartbeat_paths)) {
-    if (workerHeartbeatPath) {
-      console.log(`inspect_worker_heartbeat_path_${target}: ${workerHeartbeatPath}`);
-    }
-  }
-  for (const [target, workerIdentityPath] of Object.entries(paneStatus.recommended_inspect_worker_identity_paths)) {
-    if (workerIdentityPath) {
-      console.log(`inspect_worker_identity_path_${target}: ${workerIdentityPath}`);
-    }
-  }
-  for (const [target, workerInboxPath] of Object.entries(paneStatus.recommended_inspect_worker_inbox_paths)) {
-    if (workerInboxPath) {
-      console.log(`inspect_worker_inbox_path_${target}: ${workerInboxPath}`);
-    }
-  }
-  for (const [target, workerMailboxPath] of Object.entries(paneStatus.recommended_inspect_worker_mailbox_paths)) {
-    if (workerMailboxPath) {
-      console.log(`inspect_worker_mailbox_path_${target}: ${workerMailboxPath}`);
-    }
-  }
-  for (const [target, workerShutdownRequestPath] of Object.entries(paneStatus.recommended_inspect_worker_shutdown_request_paths)) {
-    if (workerShutdownRequestPath) {
-      console.log(`inspect_worker_shutdown_request_path_${target}: ${workerShutdownRequestPath}`);
-    }
-  }
-  for (const [target, workerShutdownAckPath] of Object.entries(paneStatus.recommended_inspect_worker_shutdown_ack_paths)) {
-    if (workerShutdownAckPath) {
-      console.log(`inspect_worker_shutdown_ack_path_${target}: ${workerShutdownAckPath}`);
-    }
-  }
-  for (const [target, teamDirPath] of Object.entries(paneStatus.recommended_inspect_team_dir_paths)) {
-    if (teamDirPath) {
-      console.log(`inspect_team_dir_path_${target}: ${teamDirPath}`);
-    }
-  }
-  for (const [target, teamConfigPath] of Object.entries(paneStatus.recommended_inspect_team_config_paths)) {
-    if (teamConfigPath) {
-      console.log(`inspect_team_config_path_${target}: ${teamConfigPath}`);
-    }
-  }
-  for (const [target, teamManifestPath] of Object.entries(paneStatus.recommended_inspect_team_manifest_paths)) {
-    if (teamManifestPath) {
-      console.log(`inspect_team_manifest_path_${target}: ${teamManifestPath}`);
-    }
-  }
-  for (const [target, teamEventsPath] of Object.entries(paneStatus.recommended_inspect_team_events_paths)) {
-    if (teamEventsPath) {
-      console.log(`inspect_team_events_path_${target}: ${teamEventsPath}`);
-    }
-  }
-  for (const [target, teamDispatchPath] of Object.entries(paneStatus.recommended_inspect_team_dispatch_paths)) {
-    if (teamDispatchPath) {
-      console.log(`inspect_team_dispatch_path_${target}: ${teamDispatchPath}`);
-    }
-  }
-  for (const [target, teamPhasePath] of Object.entries(paneStatus.recommended_inspect_team_phase_paths)) {
-    if (teamPhasePath) {
-      console.log(`inspect_team_phase_path_${target}: ${teamPhasePath}`);
-    }
-  }
-  for (const [target, teamMonitorSnapshotPath] of Object.entries(paneStatus.recommended_inspect_team_monitor_snapshot_paths)) {
-    if (teamMonitorSnapshotPath) {
-      console.log(`inspect_team_monitor_snapshot_path_${target}: ${teamMonitorSnapshotPath}`);
-    }
-  }
-  for (const [target, teamSummarySnapshotPath] of Object.entries(paneStatus.recommended_inspect_team_summary_snapshot_paths)) {
-    if (teamSummarySnapshotPath) {
-      console.log(`inspect_team_summary_snapshot_path_${target}: ${teamSummarySnapshotPath}`);
-    }
-  }
-  for (const [target, paneId] of Object.entries(paneStatus.recommended_inspect_panes)) {
-    if (paneId) {
-      console.log(`inspect_pane_${target}: ${paneId}`);
-    }
-  }
+
+  logInspectEntryDescriptors(inspectEntryDescriptors(paneStatus));
+
   if (paneStatus.recommended_inspect_command) {
-    console.log(`inspect_next: ${paneStatus.recommended_inspect_command}`);
+    const inspectCommand = modelInspect
+      ? paneStatus.recommended_inspect_command
+      : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines);
+    if (inspectCommand.trim().length > 0) console.log(`inspect_next: ${inspectCommand}`);
   }
   if (paneStatus.recommended_inspect_summary) {
-    console.log(`inspect_summary: ${paneStatus.recommended_inspect_summary}`);
+    const summaryCommand = paneStatus.recommended_inspect_command
+      ? modelInspect
+        ? paneStatus.recommended_inspect_command
+        : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines)
+      : null;
+    const summary = renderInspectSummary(paneStatus.recommended_inspect_summary, summaryCommand);
+    console.log(`inspect_summary: ${summary}`);
   }
-  for (const [index, command] of paneStatus.recommended_inspect_commands.entries()) {
+  for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
+    const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
     console.log(`inspect_priority_${index + 1}: ${command}`);
   }
   for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
-    const panePart = item.pane_id ? ` pane=${item.pane_id}` : '';
-    const cliPart = item.worker_cli ? ` cli=${item.worker_cli}` : '';
-    const rolePart = item.role ? ` role=${item.role}` : '';
-    const indexPart = typeof item.index === 'number' ? ` index=${item.index}` : '';
-    const alivePart = typeof item.alive === 'boolean' ? ` alive=${item.alive}` : '';
-    const turnCountPart = typeof item.turn_count === 'number' ? ` turn_count=${item.turn_count}` : '';
-    const turnsWithoutProgressPart = typeof item.turns_without_progress === 'number'
-      ? ` turns_without_progress=${item.turns_without_progress}`
-      : '';
-    const lastTurnPart = item.last_turn_at ? ` last_turn_at=${item.last_turn_at}` : '';
-    const statusUpdatedPart = item.status_updated_at ? ` status_updated_at=${item.status_updated_at}` : '';
-    const pidPart = typeof item.pid === 'number' ? ` pid=${item.pid}` : '';
-    const worktreeRepoRootPart = item.worktree_repo_root ? ` worktree_repo_root=${item.worktree_repo_root}` : '';
-    const worktreePathPart = item.worktree_path ? ` worktree_path=${item.worktree_path}` : '';
-    const worktreeBranchPart = item.worktree_branch ? ` worktree_branch=${item.worktree_branch}` : '';
-    const worktreeDetachedPart = typeof item.worktree_detached === 'boolean'
-      ? ` worktree_detached=${item.worktree_detached}`
-      : '';
-    const worktreeCreatedPart = typeof item.worktree_created === 'boolean'
-      ? ` worktree_created=${item.worktree_created}`
-      : '';
-    const teamStateRootPart = item.team_state_root ? ` team_state_root=${item.team_state_root}` : '';
-    const workdirPart = item.working_dir ? ` workdir=${item.working_dir}` : '';
-    const assignedTasksPart = item.assigned_tasks.length > 0 ? ` assigned_tasks=${item.assigned_tasks.join(',')}` : '';
-    const taskStatusPart = item.task_status ? ` task_status=${item.task_status}` : '';
-    const taskResultPart = item.task_result ? ` task_result=${item.task_result}` : '';
-    const taskErrorPart = item.task_error ? ` task_error=${item.task_error}` : '';
-    const taskVersionPart = typeof item.task_version === 'number' ? ` task_version=${item.task_version}` : '';
-    const taskCreatedAtPart = item.task_created_at ? ` task_created_at=${item.task_created_at}` : '';
-    const taskCompletedAtPart = item.task_completed_at ? ` task_completed_at=${item.task_completed_at}` : '';
-    const taskDependsOnPart = item.task_depends_on.length > 0 ? ` task_depends_on=${item.task_depends_on.join(',')}` : '';
-    const taskClaimPresentPart = typeof item.task_claim_present === 'boolean'
-      ? ` task_claim_present=${item.task_claim_present}`
-      : '';
-    const taskClaimOwnerPart = item.task_claim_owner ? ` task_claim_owner=${item.task_claim_owner}` : '';
-    const taskClaimTokenPart = item.task_claim_token ? ` task_claim_token=${item.task_claim_token}` : '';
-    const taskClaimLeasePart = item.task_claim_leased_until ? ` task_claim_leased_until=${item.task_claim_leased_until}` : '';
-    const taskClaimLockPathPart = item.task_claim_lock_path ? ` task_claim_lock_path=${item.task_claim_lock_path}` : '';
-    const approvalRequiredPart = typeof item.approval_required === 'boolean' ? ` approval_required=${item.approval_required}` : '';
-    const requiresCodeChangePart = typeof item.requires_code_change === 'boolean'
-      ? ` requires_code_change=${item.requires_code_change}`
-      : '';
-    const taskDescriptionPart = item.task_description ? ` description=${item.task_description}` : '';
-    const blockedByPart = item.blocked_by.length > 0 ? ` blocked_by=${item.blocked_by.join(',')}` : '';
-    const taskRolePart = item.task_role ? ` task_role=${item.task_role}` : '';
-    const taskOwnerPart = item.task_owner ? ` task_owner=${item.task_owner}` : '';
-    const approvalStatusPart = item.approval_status ? ` approval_status=${item.approval_status}` : '';
-    const approvalReviewerPart = item.approval_reviewer ? ` approval_reviewer=${item.approval_reviewer}` : '';
-    const approvalReasonPart = item.approval_reason ? ` approval_reason=${item.approval_reason}` : '';
-    const approvalDecidedAtPart = item.approval_decided_at ? ` approval_decided_at=${item.approval_decided_at}` : '';
-    const approvalRecordPresentPart = typeof item.approval_record_present === 'boolean'
-      ? ` approval_record_present=${item.approval_record_present}`
-      : '';
-    const statePart = item.state ? ` state=${item.state}` : '';
-    const stateReasonPart = item.state_reason ? ` state_reason=${item.state_reason}` : '';
-    const taskPart = item.task_id ? ` task=${item.task_id}` : '';
-    const subjectPart = item.task_subject ? ` subject=${item.task_subject}` : '';
-    const taskPathPart = item.task_path ? ` task_path=${item.task_path}` : '';
-    const approvalPathPart = item.approval_path ? ` approval_path=${item.approval_path}` : '';
-    const workerStateDirPart = item.worker_state_dir ? ` worker_state_dir=${item.worker_state_dir}` : '';
-    const workerStatusPathPart = item.worker_status_path ? ` worker_status_path=${item.worker_status_path}` : '';
-    const workerHeartbeatPathPart = item.worker_heartbeat_path ? ` worker_heartbeat_path=${item.worker_heartbeat_path}` : '';
-    const workerIdentityPathPart = item.worker_identity_path ? ` worker_identity_path=${item.worker_identity_path}` : '';
-    const workerInboxPathPart = item.worker_inbox_path ? ` worker_inbox_path=${item.worker_inbox_path}` : '';
-    const workerMailboxPathPart = item.worker_mailbox_path ? ` worker_mailbox_path=${item.worker_mailbox_path}` : '';
-    const workerShutdownRequestPathPart = item.worker_shutdown_request_path ? ` worker_shutdown_request_path=${item.worker_shutdown_request_path}` : '';
-    const workerShutdownAckPathPart = item.worker_shutdown_ack_path ? ` worker_shutdown_ack_path=${item.worker_shutdown_ack_path}` : '';
-    const teamDirPathPart = item.team_dir_path ? ` team_dir_path=${item.team_dir_path}` : '';
-    const teamConfigPathPart = item.team_config_path ? ` team_config_path=${item.team_config_path}` : '';
-    const teamManifestPathPart = item.team_manifest_path ? ` team_manifest_path=${item.team_manifest_path}` : '';
-    const teamEventsPathPart = item.team_events_path ? ` team_events_path=${item.team_events_path}` : '';
-    const teamDispatchPathPart = item.team_dispatch_path ? ` team_dispatch_path=${item.team_dispatch_path}` : '';
-    const teamPhasePathPart = item.team_phase_path ? ` team_phase_path=${item.team_phase_path}` : '';
-    const teamMonitorSnapshotPathPart = item.team_monitor_snapshot_path ? ` team_monitor_snapshot_path=${item.team_monitor_snapshot_path}` : '';
-    const teamSummarySnapshotPathPart = item.team_summary_snapshot_path ? ` team_summary_snapshot_path=${item.team_summary_snapshot_path}` : '';
-    console.log(`inspect_item_${index + 1}: target=${item.target}${panePart}${cliPart}${rolePart}${indexPart}${alivePart}${turnCountPart}${turnsWithoutProgressPart}${lastTurnPart}${statusUpdatedPart}${pidPart}${worktreeRepoRootPart}${worktreePathPart}${worktreeBranchPart}${worktreeDetachedPart}${worktreeCreatedPart}${teamStateRootPart}${workdirPart}${assignedTasksPart}${taskStatusPart}${taskResultPart}${taskErrorPart}${taskVersionPart}${taskCreatedAtPart}${taskCompletedAtPart}${taskDependsOnPart}${taskClaimPresentPart}${taskClaimOwnerPart}${taskClaimTokenPart}${taskClaimLeasePart}${taskClaimLockPathPart}${approvalRequiredPart}${requiresCodeChangePart}${taskDescriptionPart}${blockedByPart}${taskRolePart}${taskOwnerPart}${approvalStatusPart}${approvalReviewerPart}${approvalReasonPart}${approvalDecidedAtPart}${approvalRecordPresentPart}${stateReasonPart}${taskPart}${subjectPart}${taskPathPart}${approvalPathPart}${workerStateDirPart}${workerStatusPathPart}${workerHeartbeatPathPart}${workerIdentityPathPart}${workerInboxPathPart}${workerMailboxPathPart}${workerShutdownRequestPathPart}${workerShutdownAckPathPart}${teamDirPathPart}${teamConfigPathPart}${teamManifestPathPart}${teamEventsPathPart}${teamDispatchPathPart}${teamPhasePathPart}${teamMonitorSnapshotPathPart}${teamSummarySnapshotPathPart} reason=${item.reason}${statePart} command=${item.command}`);
+    console.log(formatInspectItemLine(index, item, modelInspect, tailLines));
   }
 
-  for (const [target, command] of Object.entries(paneStatus.sparkshell_commands)) {
+  for (const [target, paneId] of Object.entries({
+    ...(paneStatus.leader_pane_id ? { leader: paneStatus.leader_pane_id } : {}),
+    ...(paneStatus.hud_pane_id ? { hud: paneStatus.hud_pane_id } : {}),
+    ...paneStatus.worker_panes,
+  })) {
+    const modelCommand = paneStatus.sparkshell_commands[target];
+    const command = modelInspect && modelCommand ? modelCommand : rawTmuxCaptureCommand(paneId, tailLines);
     console.log(`inspect_${target}: ${command}`);
   }
 }
 
-function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
+export function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamArgs {
   const tokens = [...args];
   let workerCount = 3;
   let agentType = 'executor';
@@ -920,9 +884,62 @@ function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamA
     }
   }
 
+  const explicitApprovedCommand = followupContext == null
+    ? buildExplicitOmxTeamLaunchCommand(
+      effectiveTask,
+      workerCount,
+      explicitWorkerCount,
+      agentType,
+      explicitAgentType,
+    )
+    : null;
+  const exactCommandHintOutcome = explicitApprovedCommand
+    ? readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      command: explicitApprovedCommand,
+    })
+    : null;
+  const approvedHintOutcome = followupContext
+    ? null
+    : exactCommandHintOutcome && exactCommandHintOutcome.status !== 'absent'
+      ? exactCommandHintOutcome
+    : readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      workerCount,
+      ...(explicitAgentType ? { agentType } : {}),
+      linkedRalph: false,
+    });
+  const approvedHint = followupContext?.approvedHint
+    ?? (approvedHintOutcome?.status === 'resolved' ? approvedHintOutcome.hint : null);
+  const matchesApprovedLaunchHint = followupContext == null
+    && approvedHint?.task.trim() === effectiveTask.trim()
+    && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
+    && (approvedHint.agentType == null || approvedHint.agentType === agentType)
+    && Boolean(approvedHint.linkedRalph) === false;
+  const allowRepoAwareDagHandoff = followupContext != null || matchesApprovedLaunchHint;
+  const dagFallbackReason = undefined;
+  const approvedRepositoryContextSummary = allowRepoAwareDagHandoff
+    ? approvedHint?.repositoryContextSummary
+    : undefined;
+
   const teamName = sanitizeTeamName(slugifyTask(effectiveTask));
-  return { workerCount, agentType, explicitAgentType, explicitWorkerCount, task: effectiveTask, teamName };
+  return {
+    workerCount,
+    agentType,
+    explicitAgentType,
+    explicitWorkerCount,
+    task: effectiveTask,
+    teamName,
+    displayName: teamName,
+    allowRepoAwareDagHandoff,
+    ...(dagFallbackReason ? { dagFallbackReason } : {}),
+    ...(approvedRepositoryContextSummary ? { approvedRepositoryContextSummary } : {}),
+    ...(allowRepoAwareDagHandoff && approvedHint
+      ? { approvedExecution: buildApprovedTeamExecutionBinding(approvedHint) }
+      : {}),
+  };
 }
+
 
 export function parseTeamStartArgs(args: string[]): ParsedTeamStartArgs {
   const parsedWorktree = parseWorktreeMode(args);
@@ -1226,6 +1243,7 @@ async function ensureTeamModeState(
       task_description: parsed.task,
       current_phase: currentPhase,
       team_name: parsed.teamName,
+      display_name: parsed.displayName ?? parsed.teamName,
       agent_count: parsed.workerCount,
       agent_types: roleDistribution,
       available_agent_types: availableAgentTypes,
@@ -1241,6 +1259,7 @@ async function ensureTeamModeState(
     active,
     current_phase: currentPhase,
     team_name: parsed.teamName,
+    display_name: parsed.displayName ?? parsed.teamName,
     agent_count: parsed.workerCount,
     agent_types: roleDistribution,
     available_agent_types: availableAgentTypes,
@@ -1311,6 +1330,7 @@ async function persistTeamShutdownModeState(
         explicitAgentType: false,
         explicitWorkerCount: false,
         teamName,
+        allowRepoAwareDagHandoff: false,
       });
     } else {
       await startMode('team', `shutdown team ${teamName}`, 50, cwd);
@@ -1360,6 +1380,7 @@ export function buildLeaderMonitoringHints(teamName: string): string[] {
 
 export async function teamCommand(args: string[], _options: TeamCliOptions = {}): Promise<void> {
   const cwd = process.cwd();
+  const codexHomeOverride = resolveCodexHomeForLaunch(cwd, process.env);
   const parsedWorktree = parseWorktreeMode(args);
   const worktreeMode = resolveDefaultTeamWorktreeMode(parsedWorktree.mode);
   const teamArgs = parsedWorktree.remainingArgs;
@@ -1436,8 +1457,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     const name = teamArgs[1];
     const wantsJson = teamArgs.includes('--json');
     if (!name) throw new Error('Usage: omx team status <team-name> [--json]');
-    await recordLeaderRuntimeActivity(cwd, 'team_status', name);
-    const snapshot = await monitorTeam(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    await recordLeaderRuntimeActivity(cwd, 'team_status', resolvedName);
+    const snapshot = await monitorTeam(resolvedName, cwd);
     if (!snapshot) {
       if (wantsJson) {
         console.log(JSON.stringify({
@@ -1452,8 +1474,17 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       return;
     }
     const tailLines = parseStatusTailLines(teamArgs.slice(2));
-    const config = await readTeamConfig(name, cwd);
+    const modelInspect = parseStatusModelInspect(teamArgs.slice(2));
+    const config = await readTeamConfig(resolvedName, cwd);
     const paneStatus = await readTeamPaneStatus(config, cwd, snapshot, tailLines);
+    const ultragoalContext = await readPersistedTeamUltragoalContext(
+      resolvedName,
+      config?.leader_cwd ?? cwd,
+      config?.team_state_root ?? undefined,
+    );
+    const ultragoalCheckpointGuidance = ultragoalContext
+      ? buildUltragoalCheckpointGuidance(ultragoalContext)
+      : null;
     if (wantsJson) {
       console.log(JSON.stringify({
         ...buildJsonBase(),
@@ -1480,6 +1511,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         },
         performance: snapshot.performance ?? null,
         panes: paneStatus,
+        ...(ultragoalCheckpointGuidance
+          ? { ultragoal_checkpoint_guidance: ultragoalCheckpointGuidance }
+          : {}),
       }));
       return;
     }
@@ -1500,7 +1534,10 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         `monitor_perf_ms: total=${snapshot.performance.total_ms} list=${snapshot.performance.list_tasks_ms} workers=${snapshot.performance.worker_scan_ms} mailbox=${snapshot.performance.mailbox_delivery_ms}`
       );
     }
-    renderTeamPaneStatus(paneStatus);
+    for (const line of renderUltragoalCheckpointGuidanceText(ultragoalContext)) {
+      console.log(line);
+    }
+    renderTeamPaneStatus(paneStatus, modelInspect, tailLines);
     return;
   }
 
@@ -1514,7 +1551,8 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       ? Math.max(1, Number.parseInt(teamArgs[timeoutIdx + 1]!, 10) || 0)
       : 30_000;
     const afterEventId = afterIdx >= 0 ? (teamArgs[afterIdx + 1] || '') : '';
-    const config = await readTeamConfig(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const config = await readTeamConfig(resolvedName, cwd);
     if (!config) {
       if (wantsJson) {
         console.log(JSON.stringify({ team_name: name, status: 'missing', cursor: afterEventId || '', event: null }));
@@ -1524,9 +1562,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       return;
     }
 
-    const baselineCursor = afterEventId || (await readTeamEvents(name, cwd, { wakeableOnly: true }).then((events) => events.at(-1)?.event_id ?? ''));
-    const snapshot = await monitorTeam(name, cwd);
-    const immediateEvent = await readTeamEvents(name, cwd, {
+    const baselineCursor = afterEventId || (await readTeamEvents(resolvedName, cwd, { wakeableOnly: true }).then((events) => events.at(-1)?.event_id ?? ''));
+    const snapshot = await monitorTeam(resolvedName, cwd);
+    const immediateEvent = await readTeamEvents(resolvedName, cwd, {
       afterEventId: baselineCursor || undefined,
       wakeableOnly: true,
     }).then((events) => events[0]);
@@ -1535,7 +1573,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       immediateEvent
         ? { status: 'event' as const, cursor: immediateEvent.event_id, event: immediateEvent }
         : snapshot && snapshotHasDeadWorkerStall(snapshot)
-          ? await readTeamEvents(name, cwd, { wakeableOnly: true }).then((events) => {
+          ? await readTeamEvents(resolvedName, cwd, { wakeableOnly: true }).then((events) => {
             const latestWakeableEvent = events.at(-1);
             if (latestWakeableEvent) {
               return {
@@ -1544,12 +1582,12 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
                 event: latestWakeableEvent,
               };
             }
-            const fallbackEvent = buildDeadWorkerAwaitEvent(name, snapshot);
+            const fallbackEvent = buildDeadWorkerAwaitEvent(resolvedName, snapshot);
             return fallbackEvent
               ? { status: 'event' as const, cursor: baselineCursor, event: fallbackEvent }
               : { status: 'timeout' as const, cursor: baselineCursor };
           })
-          : await waitForTeamEvent(name, cwd, {
+          : await waitForTeamEvent(resolvedName, cwd, {
             afterEventId: baselineCursor || undefined,
             timeoutMs,
             pollMs: 100,
@@ -1558,7 +1596,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
 
     if (wantsJson) {
       console.log(JSON.stringify({
-        team_name: sanitizeTeamName(name),
+        team_name: resolvedName,
         status: result.status,
         cursor: result.cursor,
         event: result.event ?? null,
@@ -1573,7 +1611,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
 
     const event = result.event!;
     const context = [
-      `team=${name}`,
+      `team=${resolvedName}`,
       `event=${event.type}`,
       `worker=${event.worker}`,
       event.state ? `state=${event.state}` : '',
@@ -1600,11 +1638,14 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       explicitAgentType: false,
       explicitWorkerCount: false,
       teamName: runtime.teamName,
+      displayName: runtime.config.display_name ?? runtime.teamName,
+      allowRepoAwareDagHandoff: false,
     });
     const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
       workerCount: runtime.config.worker_count,
       fallbackRole: resolveImplicitTeamFallbackRole(runtime.config.agent_type, false),
+      codexHomeOverride,
     });
     await renderStartSummary(runtime, staffingPlan);
     return;
@@ -1615,10 +1656,11 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     if (!name) throw new Error('Usage: omx team shutdown <team-name> [--force] [--confirm-issues]');
     const force = teamArgs.includes('--force');
     const confirmIssues = teamArgs.includes('--confirm-issues');
-    const configBeforeShutdown = await readTeamConfig(name, cwd);
-    const summary = await shutdownTeam(name, cwd, { force, confirmIssues });
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const configBeforeShutdown = await readTeamConfig(resolvedName, cwd);
+    const summary = await shutdownTeam(resolvedName, cwd, { force, confirmIssues });
     await persistTeamShutdownModeState(
-      name,
+      resolvedName,
       cwd,
       configBeforeShutdown
         ? {
@@ -1642,13 +1684,18 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   }
 
   const parsed = parseTeamArgs(teamArgs, cwd);
-  const executionPlan = buildTeamExecutionPlan(
-    parsed.task,
-    parsed.workerCount,
-    parsed.agentType,
-    parsed.explicitAgentType,
-    parsed.explicitWorkerCount,
-  );
+  const executionPlan = buildRepoAwareTeamExecutionPlan({
+    task: parsed.task,
+    workerCount: parsed.workerCount,
+    agentType: parsed.agentType,
+    explicitAgentType: parsed.explicitAgentType,
+    explicitWorkerCount: parsed.explicitWorkerCount,
+    cwd,
+    buildLegacyPlan: buildTeamExecutionPlan,
+    allowDagHandoff: parsed.allowRepoAwareDagHandoff,
+    dagFallbackReason: parsed.dagFallbackReason,
+    approvedRepositoryContextSummary: parsed.approvedRepositoryContextSummary,
+  });
   const tasks = executionPlan.tasks;
   const effectiveParsed = executionPlan.workerCount === parsed.workerCount
     ? parsed
@@ -1657,6 +1704,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   const staffingPlan = buildFollowupStaffingPlan('team', parsed.task, availableAgentTypes, {
     workerCount: executionPlan.workerCount,
     fallbackRole: resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType),
+    codexHomeOverride,
   });
   const runtime = await startTeam(
     parsed.teamName,
@@ -1665,9 +1713,14 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     executionPlan.workerCount,
     tasks,
     cwd,
-    { worktreeMode },
+    {
+      codexHomeOverride,
+      worktreeMode,
+      decompositionMetadata: executionPlan.metadata,
+      approvedExecution: parsed.approvedExecution ?? null,
+    },
   );
 
-  await ensureTeamModeState(effectiveParsed, tasks);
+  await ensureTeamModeState({ ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName }, tasks);
   await renderStartSummary(runtime, staffingPlan);
 }

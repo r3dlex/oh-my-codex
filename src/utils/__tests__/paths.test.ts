@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "path";
 import { homedir, tmpdir } from "os";
 import { existsSync } from "fs";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "fs/promises";
 import {
   codexHome,
   codexConfigPath,
@@ -14,12 +14,17 @@ import {
   listInstalledSkillDirectories,
   detectLegacySkillRootOverlap,
   omxStateDir,
+  omxRoot,
   omxProjectMemoryPath,
+  canonicalProjectMemoryPath,
+  projectMemoryPathCandidates,
+  resolveProjectMemoryPath,
   omxNotepadPath,
   omxPlansDir,
   omxAdaptersDir,
   omxLogsDir,
   packageRoot,
+  canonicalizeComparablePath,
   OMX_ENTRY_PATH_ENV,
   OMX_STARTUP_CWD_ENV,
   rememberOmxLaunchContext,
@@ -345,12 +350,43 @@ describe("listInstalledSkillDirectories", () => {
 });
 
 describe("omxStateDir", () => {
+  let originalOmxRoot: string | undefined;
+  let originalOmxStateRoot: string | undefined;
+
+  beforeEach(() => {
+    originalOmxRoot = process.env.OMX_ROOT;
+    originalOmxStateRoot = process.env.OMX_STATE_ROOT;
+  });
+
+  afterEach(() => {
+    if (typeof originalOmxRoot === "string") process.env.OMX_ROOT = originalOmxRoot;
+    else delete process.env.OMX_ROOT;
+    if (typeof originalOmxStateRoot === "string") process.env.OMX_STATE_ROOT = originalOmxStateRoot;
+    else delete process.env.OMX_STATE_ROOT;
+  });
+
   it("uses provided projectRoot", () => {
     assert.equal(omxStateDir("/my/project"), join("/my/project", ".omx", "state"));
   });
 
   it("defaults to cwd when no projectRoot given", () => {
     assert.equal(omxStateDir(), join(process.cwd(), ".omx", "state"));
+  });
+
+  it("uses OMX_ROOT override when set", () => {
+    process.env.OMX_ROOT = "/tmp/omx-root";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-root/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-root/.omx/state");
+  });
+
+  it("uses OMX_ROOT as boxed workspace root for all runtime paths", () => {
+    process.env.OMX_ROOT = "/tmp/omx-box";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-box/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-box/.omx/state");
+    assert.equal(omxProjectMemoryPath("/ignored/project"), "/tmp/omx-box/.omx/project-memory.json");
+    assert.equal(omxNotepadPath("/ignored/project"), "/tmp/omx-box/.omx/notepad.md");
+    assert.equal(omxPlansDir("/ignored/project"), "/tmp/omx-box/.omx/plans");
+    assert.equal(omxLogsDir("/ignored/project"), "/tmp/omx-box/.omx/logs");
   });
 });
 
@@ -367,6 +403,38 @@ describe("omxProjectMemoryPath", () => {
       omxProjectMemoryPath(),
       join(process.cwd(), ".omx", "project-memory.json"),
     );
+  });
+});
+
+describe("project memory startup path resolution", () => {
+  it("prefers repository project-memory.json over legacy .omx/project-memory.json", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-project-memory-paths-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(join(wd, "project-memory.json"), "{}");
+      await writeFile(join(wd, ".omx", "project-memory.json"), "{}");
+
+      assert.equal(canonicalProjectMemoryPath(wd), join(wd, "project-memory.json"));
+      assert.deepEqual(projectMemoryPathCandidates(wd), [
+        join(wd, "project-memory.json"),
+        join(wd, ".omx", "project-memory.json"),
+      ]);
+      assert.equal(resolveProjectMemoryPath(wd), join(wd, "project-memory.json"));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to legacy .omx/project-memory.json when canonical memory is absent", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-project-memory-legacy-path-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(join(wd, ".omx", "project-memory.json"), "{}");
+
+      assert.equal(resolveProjectMemoryPath(wd), join(wd, ".omx", "project-memory.json"));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -408,6 +476,10 @@ describe("packageRoot", () => {
 });
 
 describe("OMX launcher path resolution", () => {
+  // Existing launcher files are resolved through realpath before being stored or
+  // compared. These assertions intentionally use canonicalized expected paths
+  // so macOS /var -> /private/var temp roots and symlinked launch directories
+  // exercise the same canonical-realpath contract as production launch context.
   const originalEntryPath = process.env[OMX_ENTRY_PATH_ENV];
   const originalStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
 
@@ -442,9 +514,44 @@ describe("OMX launcher path resolution", () => {
         },
       });
 
-      assert.equal(resolved, launcherPath);
+      assert.equal(resolved, canonicalizeComparablePath(launcherPath));
     } finally {
       await rm(startupCwd, { recursive: true, force: true });
+      await rm(laterCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalizes symlinked startup cwd launcher paths to their real path", async () => {
+    const realRoot = await mkdtemp(join(tmpdir(), "omx-launcher-real-root-"));
+    const linkParent = await mkdtemp(join(tmpdir(), "omx-launcher-link-root-"));
+    const laterCwd = await mkdtemp(join(tmpdir(), "omx-launcher-symlink-later-"));
+    const realStartupCwd = join(realRoot, "project");
+    const linkedStartupCwd = join(linkParent, "project-link");
+    try {
+      const launcherDir = join(realStartupCwd, "dist", "cli");
+      const launcherPath = join(launcherDir, "omx.js");
+      await mkdir(launcherDir, { recursive: true });
+      await writeFile(launcherPath, "#!/usr/bin/env node\n", "utf-8");
+      await symlink(
+        realStartupCwd,
+        linkedStartupCwd,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const resolved = resolveOmxEntryPath({
+        argv1: "dist/cli/omx.js",
+        cwd: laterCwd,
+        env: {
+          ...process.env,
+          [OMX_STARTUP_CWD_ENV]: linkedStartupCwd,
+        },
+      });
+
+      assert.equal(resolved, await realpath(launcherPath));
+      assert.notEqual(resolved, join(linkedStartupCwd, "dist", "cli", "omx.js"));
+    } finally {
+      await rm(realRoot, { recursive: true, force: true });
+      await rm(linkParent, { recursive: true, force: true });
       await rm(laterCwd, { recursive: true, force: true });
     }
   });
@@ -466,8 +573,58 @@ describe("OMX launcher path resolution", () => {
       });
 
       assert.equal(process.env[OMX_STARTUP_CWD_ENV], startupCwd);
-      assert.equal(process.env[OMX_ENTRY_PATH_ENV], launcherPath);
+      assert.equal(process.env[OMX_ENTRY_PATH_ENV], canonicalizeComparablePath(launcherPath));
     } finally {
+      await rm(startupCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers explicit argv1 over an ambient OMX_ENTRY_PATH override", async () => {
+    const startupCwd = await mkdtemp(join(tmpdir(), "omx-launcher-explicit-start-"));
+    try {
+      const launcherDir = join(startupCwd, "dist", "cli");
+      const launcherPath = join(launcherDir, "omx.js");
+      await mkdir(launcherDir, { recursive: true });
+      await writeFile(launcherPath, "#!/usr/bin/env node\n", "utf-8");
+
+      const resolved = resolveOmxEntryPath({
+        argv1: "dist/cli/omx.js",
+        cwd: startupCwd,
+        env: {
+          ...process.env,
+          [OMX_ENTRY_PATH_ENV]: "/tmp/ambient-omx.js",
+          [OMX_STARTUP_CWD_ENV]: startupCwd,
+        },
+      });
+
+      assert.equal(resolved, canonicalizeComparablePath(launcherPath));
+    } finally {
+      await rm(startupCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records the default launcher path when called without an explicit argv1", async () => {
+    const startupCwd = await mkdtemp(join(tmpdir(), "omx-launcher-default-record-"));
+    const originalArgv1 = process.argv[1];
+    try {
+      const launcherDir = join(startupCwd, "dist", "cli");
+      const launcherPath = join(launcherDir, "omx.js");
+      await mkdir(launcherDir, { recursive: true });
+      await writeFile(launcherPath, "#!/usr/bin/env node\n", "utf-8");
+
+      delete process.env[OMX_ENTRY_PATH_ENV];
+      delete process.env[OMX_STARTUP_CWD_ENV];
+      process.argv[1] = launcherPath;
+
+      rememberOmxLaunchContext({
+        cwd: startupCwd,
+        env: process.env,
+      });
+
+      assert.equal(process.env[OMX_STARTUP_CWD_ENV], startupCwd);
+      assert.equal(process.env[OMX_ENTRY_PATH_ENV], canonicalizeComparablePath(launcherPath));
+    } finally {
+      process.argv[1] = originalArgv1;
       await rm(startupCwd, { recursive: true, force: true });
     }
   });
@@ -495,7 +652,7 @@ describe("OMX launcher path resolution", () => {
         packageRootDir,
       });
 
-      assert.equal(resolved, cliPath);
+      assert.equal(resolved, canonicalizeComparablePath(cliPath));
     } finally {
       await rm(startupCwd, { recursive: true, force: true });
       await rm(packageRootDir, { recursive: true, force: true });
@@ -519,7 +676,7 @@ describe("OMX launcher path resolution", () => {
         },
       });
 
-      assert.equal(resolved, cliPath);
+      assert.equal(resolved, canonicalizeComparablePath(cliPath));
     } finally {
       await rm(startupCwd, { recursive: true, force: true });
     }
@@ -546,7 +703,7 @@ describe("OMX launcher path resolution", () => {
         packageRootDir,
       });
 
-      assert.equal(resolved, cliPath);
+      assert.equal(resolved, canonicalizeComparablePath(cliPath));
     } finally {
       await rm(startupCwd, { recursive: true, force: true });
       await rm(packageRootDir, { recursive: true, force: true });

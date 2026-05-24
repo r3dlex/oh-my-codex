@@ -8,18 +8,25 @@
 import { readFile, writeFile, mkdir, unlink, appendFile, rm } from 'fs/promises';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
-import { omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
+import { omxRoot, omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import { getStateFilePath } from '../mcp/state-paths.js';
 
 export interface SessionState {
   session_id: string;
   native_session_id?: string;
+  // Native session replacement metadata used when Codex /new swaps the native
+  // session while the original OMX launch wrapper is still responsible for
+  // archiving/cleanup.
+  previous_native_session_id?: string;
+  native_session_switched_at?: string;
+  owner_omx_session_id?: string;
   started_at: string;
   cwd: string;
   pid: number;
   platform?: NodeJS.Platform;
   pid_start_ticks?: number;
   pid_cmdline?: string;
+  tmux_session_name?: string;
 }
 
 const SESSION_FILE = 'session.json';
@@ -65,7 +72,7 @@ async function removeDeadSessionHudState(
  * into a new Codex session.
  */
 export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
-  const omxDir = join(cwd, '.omx');
+  const omxDir = omxRoot(cwd);
   const stateDir = omxStateDir(cwd);
   await mkdir(omxDir, { recursive: true });
   await mkdir(stateDir, { recursive: true });
@@ -158,6 +165,10 @@ interface SessionStartOptions {
   pid?: number;
   platform?: NodeJS.Platform;
   nativeSessionId?: string;
+  previousNativeSessionId?: string;
+  nativeSessionSwitchedAt?: string;
+  ownerOmxSessionId?: string;
+  tmuxSessionName?: string;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -220,23 +231,46 @@ function createSessionState(
   options: {
     nowIso?: string;
     nativeSessionId?: string;
+    previousNativeSessionId?: string;
+    nativeSessionSwitchedAt?: string;
+    ownerOmxSessionId?: string;
     startedAt?: string;
+    tmuxSessionName?: string;
   } = {},
 ): SessionState {
   const nowIso = options.nowIso ?? new Date().toISOString();
   const nativeSessionId = typeof options.nativeSessionId === 'string' && options.nativeSessionId.trim()
     ? options.nativeSessionId.trim()
     : undefined;
+  const tmuxSessionName = typeof options.tmuxSessionName === 'string' && options.tmuxSessionName.trim()
+    ? options.tmuxSessionName.trim()
+    : undefined;
+  const previousNativeSessionId =
+    typeof options.previousNativeSessionId === 'string' && options.previousNativeSessionId.trim()
+      ? options.previousNativeSessionId.trim()
+      : undefined;
+  const nativeSessionSwitchedAt =
+    typeof options.nativeSessionSwitchedAt === 'string' && options.nativeSessionSwitchedAt.trim()
+      ? options.nativeSessionSwitchedAt.trim()
+      : undefined;
+  const ownerOmxSessionId =
+    typeof options.ownerOmxSessionId === 'string' && options.ownerOmxSessionId.trim()
+      ? options.ownerOmxSessionId.trim()
+      : undefined;
 
   return {
     session_id: sessionId,
     ...(nativeSessionId ? { native_session_id: nativeSessionId } : {}),
+    ...(previousNativeSessionId ? { previous_native_session_id: previousNativeSessionId } : {}),
+    ...(nativeSessionSwitchedAt ? { native_session_switched_at: nativeSessionSwitchedAt } : {}),
+    ...(ownerOmxSessionId ? { owner_omx_session_id: ownerOmxSessionId } : {}),
     started_at: options.startedAt ?? nowIso,
     cwd,
     pid,
     platform,
     pid_start_ticks: linuxIdentity?.startTicks,
     pid_cmdline: linuxIdentity?.cmdline ?? undefined,
+    ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
   };
 }
 
@@ -293,6 +327,10 @@ export async function writeSessionStart(
     : null;
   const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
     nativeSessionId: options.nativeSessionId,
+    previousNativeSessionId: options.previousNativeSessionId,
+    nativeSessionSwitchedAt: options.nativeSessionSwitchedAt,
+    ownerOmxSessionId: options.ownerOmxSessionId,
+    tmuxSessionName: options.tmuxSessionName,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -306,11 +344,21 @@ export async function writeSessionStart(
   return state;
 }
 
+function getOmxLaunchSessionId(state: SessionState): string | undefined {
+  if (state.session_id.startsWith('omx-')) return state.session_id;
+  if (typeof state.owner_omx_session_id === 'string' && state.owner_omx_session_id.startsWith('omx-')) {
+    return state.owner_omx_session_id;
+  }
+  return undefined;
+}
+
 /**
  * Reconcile a native/Codex SessionStart with the canonical OMX launch session.
- * If an authoritative current session already exists for this cwd/run, preserve
- * its OMX scope id and refresh PID/native metadata. Otherwise establish a fresh
- * canonical session using the native session id.
+ * Same-native restarts preserve the current logical session and refresh
+ * PID/native metadata. Native-session replacements start a fresh native-scoped
+ * session to avoid inheriting stale task-scoped state; when the replaced session
+ * belongs to an OMX launch wrapper, retain that wrapper as owner for later
+ * archive/cleanup and log the replacement chain.
  */
 export async function reconcileNativeSessionStart(
   cwd: string,
@@ -331,6 +379,31 @@ export async function reconcileNativeSessionStart(
     ? existing.native_session_id.trim()
     : '';
   if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
+    const ownerOmxSessionId = getOmxLaunchSessionId(existing);
+    if (ownerOmxSessionId) {
+      const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+        ? options.pid
+        : process.pid;
+      const nowIso = new Date().toISOString();
+      await appendToLog(cwd, {
+        event: 'native_session_replaced',
+        session_id: ownerOmxSessionId,
+        ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
+        previous_native_session_id: existingNativeSessionId,
+        replaced_by_native_session_id: nativeSessionId,
+        pid,
+        timestamp: nowIso,
+      });
+
+      return await writeSessionStart(cwd, nativeSessionId, {
+        ...options,
+        nativeSessionId,
+        previousNativeSessionId: existingNativeSessionId,
+        nativeSessionSwitchedAt: nowIso,
+        ownerOmxSessionId,
+      });
+    }
+
     return await writeSessionStart(cwd, nativeSessionId, {
       ...options,
       nativeSessionId,
@@ -348,7 +421,11 @@ export async function reconcileNativeSessionStart(
   const state = createSessionState(cwd, existing.session_id, pid, platform, linuxIdentity, {
     nowIso,
     nativeSessionId,
+    previousNativeSessionId: existing.previous_native_session_id,
+    nativeSessionSwitchedAt: existing.native_session_switched_at,
+    ownerOmxSessionId: existing.owner_omx_session_id,
     startedAt: existing.started_at,
+    tmuxSessionName: existing.tmux_session_name,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -368,37 +445,58 @@ export async function reconcileNativeSessionStart(
 export async function writeSessionEnd(cwd: string, sessionId: string): Promise<void> {
   const state = await readSessionState(cwd);
   const endTime = new Date().toISOString();
+  const ownsCurrentSessionFile = state == null
+    || state.session_id === sessionId
+    || state.native_session_id === sessionId
+    || state.owner_omx_session_id === sessionId;
 
   // Archive to session history
   const logsDir = omxLogsDir(cwd);
   await mkdir(logsDir, { recursive: true });
 
   const historyEntry = {
-    session_id: state?.session_id || sessionId,
-    ...(state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
-    started_at: state?.started_at || 'unknown',
+    session_id: ownsCurrentSessionFile
+      ? (state?.owner_omx_session_id === sessionId ? sessionId : state?.session_id || sessionId)
+      : sessionId,
+    ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    started_at: ownsCurrentSessionFile ? state?.started_at || 'unknown' : 'unknown',
     ended_at: endTime,
     cwd,
-    pid: state?.pid || process.pid,
+    pid: ownsCurrentSessionFile ? state?.pid || process.pid : process.pid,
+    ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
+      ? { active_session_id: state.session_id }
+      : {}),
+    ...(!ownsCurrentSessionFile && state?.session_id
+      ? { preserved_active_session_id: state.session_id }
+      : {}),
   };
 
   await appendFile(historyPath(cwd), JSON.stringify(historyEntry) + '\n');
 
   await removeDeadSessionHudState(cwd, [
-    state?.session_id,
-    state?.native_session_id,
+    ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
     sessionId,
   ]);
 
-  // Delete session.json
-  try {
-    await unlink(sessionPath(cwd));
-  } catch { /* already gone */ }
+  // Delete session.json only when this end event owns the current pointer.
+  if (ownsCurrentSessionFile) {
+    try {
+      await unlink(sessionPath(cwd));
+    } catch { /* already gone */ }
+  }
 
   await appendToLog(cwd, {
     event: 'session_end',
-    session_id: state?.session_id || sessionId,
-    ...(state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    session_id: ownsCurrentSessionFile
+      ? (state?.owner_omx_session_id === sessionId ? sessionId : state?.session_id || sessionId)
+      : sessionId,
+    ...(ownsCurrentSessionFile && state?.native_session_id ? { native_session_id: state.native_session_id } : {}),
+    ...(ownsCurrentSessionFile && state?.owner_omx_session_id === sessionId && state?.session_id
+      ? { active_session_id: state.session_id }
+      : {}),
+    ...(!ownsCurrentSessionFile && state?.session_id
+      ? { preserved_active_session_id: state.session_id }
+      : {}),
     timestamp: endTime,
   });
 }

@@ -11,15 +11,17 @@
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { withModeRuntimeContext } from '../state/mode-state-context.js';
 import { dirname, join } from 'node:path';
 import { classifyTaskSize, isHeavyMode, type TaskSizeResult, type TaskSizeThresholds } from './task-size-detector.js';
 import { isApprovedExecutionFollowupShortcut, type FollowupMode } from '../team/followup-planner.js';
 import { isPlanningComplete, readPlanningArtifacts } from '../planning/artifacts.js';
+import { hasDurableRalplanConsensusEvidenceForCwd } from '../ralplan/consensus-gate.js';
 import { KEYWORD_TRIGGER_DEFINITIONS, compareKeywordMatches } from './keyword-registry.js';
 import {
   SKILL_ACTIVE_STATE_FILE,
   listActiveSkills,
-  writeSkillActiveStateCopies,
+  writeSkillActiveStateCopiesForStateDir,
   type SkillActiveEntry,
 } from '../state/skill-active.js';
 import {
@@ -50,7 +52,7 @@ function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing';
+export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing' | 'ralplan' | 'deep-interview';
 
 export interface DeepInterviewInputLock {
   active: boolean;
@@ -88,6 +90,7 @@ export interface SkillActiveState {
 
 export interface RecordSkillActivationInput {
   stateDir: string;
+  sourceCwd?: string;
   text: string;
   sessionId?: string;
   threadId?: string;
@@ -105,7 +108,7 @@ export const DEEP_INTERVIEW_STATE_FILE = 'deep-interview-state.json';
 export const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'] as const;
 export const DEEP_INTERVIEW_INPUT_LOCK_MESSAGE = 'Deep interview is active; auto-approval shortcuts are blocked until the interview finishes.';
 
-type StatefulSkillMode = 'deep-interview' | 'autopilot' | 'ralph' | 'ralplan' | 'ultrawork' | 'ultraqa' | 'team' | 'autoresearch';
+type StatefulSkillMode = 'deep-interview' | 'autopilot' | 'ralph' | 'ralplan' | 'ultragoal' | 'ultrawork' | 'ultraqa' | 'team' | 'autoresearch';
 
 interface StatefulSkillSeedConfig {
   mode: StatefulSkillMode;
@@ -124,17 +127,19 @@ const EXECUTION_LIKE_WORKFLOW_SKILLS = new Set<TrackedWorkflowMode>([
   'autoresearch',
   'ralph',
   'team',
+  'ultragoal',
   'ultrawork',
   'ultraqa',
 ]);
 
 const STATEFUL_SKILL_SEED_CONFIG: Record<StatefulSkillMode, StatefulSkillSeedConfig> = {
   'deep-interview': { mode: 'deep-interview', initialPhase: 'intent-first' },
-  autopilot: { mode: 'autopilot', initialPhase: 'planning' },
+  autopilot: { mode: 'autopilot', initialPhase: 'deep-interview', includeIteration: true },
   autoresearch: { mode: 'autoresearch', initialPhase: 'executing' },
   ralph: { mode: 'ralph', initialPhase: 'starting', includeIteration: true },
   ralplan: { mode: 'ralplan', initialPhase: 'planning' },
   team: { mode: 'team', initialPhase: 'starting', scope: 'root' },
+  ultragoal: { mode: 'ultragoal', initialPhase: 'planning' },
   ultrawork: { mode: 'ultrawork', initialPhase: 'planning' },
   ultraqa: { mode: 'ultraqa', initialPhase: 'planning' },
 };
@@ -142,6 +147,8 @@ const STATEFUL_SKILL_SEED_CONFIG: Record<StatefulSkillMode, StatefulSkillSeedCon
 export interface DeepInterviewModeState {
   active: boolean;
   mode: 'deep-interview';
+  tmux_pane_id?: string;
+  tmux_pane_set_at?: string;
   current_phase: string;
   started_at: string;
   updated_at: string;
@@ -151,6 +158,7 @@ export interface DeepInterviewModeState {
   turn_id?: string;
   input_lock?: DeepInterviewInputLock;
   question_enforcement?: DeepInterviewQuestionEnforcementState;
+  [key: string]: unknown;
 }
 
 function createDeepInterviewInputLock(nowIso: string, previous?: DeepInterviewInputLock): DeepInterviewInputLock {
@@ -247,18 +255,24 @@ export async function persistDeepInterviewModeState(
       'handoff',
       new Date(nowIso),
     );
-    const nextState: DeepInterviewModeState = {
-      active: true,
-      mode: 'deep-interview',
-      current_phase: previousModeState?.active ? previousModeState.current_phase || 'intent-first' : 'intent-first',
-      started_at: previousModeState?.active ? previousModeState.started_at || nowIso : nowIso,
-      updated_at: nowIso,
-      session_id: input.sessionId ?? previousModeState?.session_id,
-      thread_id: input.threadId ?? previousModeState?.thread_id,
-      turn_id: input.turnId ?? previousModeState?.turn_id,
-      ...(nextSkill.input_lock ? { input_lock: nextSkill.input_lock } : {}),
-      ...(nextQuestionEnforcement ? { question_enforcement: nextQuestionEnforcement } : {}),
-    };
+    const nextState = withModeRuntimeContext<DeepInterviewModeState>(
+      previousModeState ?? {},
+      {
+        ...(previousModeState?.tmux_pane_id ? { tmux_pane_id: previousModeState.tmux_pane_id } : {}),
+        ...(previousModeState?.tmux_pane_set_at ? { tmux_pane_set_at: previousModeState.tmux_pane_set_at } : {}),
+        active: true,
+        mode: 'deep-interview',
+        current_phase: previousModeState?.active ? previousModeState.current_phase || 'intent-first' : 'intent-first',
+        started_at: previousModeState?.active ? previousModeState.started_at || nowIso : nowIso,
+        updated_at: nowIso,
+        session_id: input.sessionId ?? previousModeState?.session_id,
+        thread_id: input.threadId ?? previousModeState?.thread_id,
+        turn_id: input.turnId ?? previousModeState?.turn_id,
+        ...(nextSkill.input_lock ? { input_lock: nextSkill.input_lock } : {}),
+        ...(nextQuestionEnforcement ? { question_enforcement: nextQuestionEnforcement } : {}),
+      },
+      { nowIso },
+    );
     await writeFile(statePath, JSON.stringify(nextState, null, 2));
     return;
   }
@@ -269,6 +283,8 @@ export async function persistDeepInterviewModeState(
   const releasedInputLock = nextSkill?.skill === 'deep-interview' ? nextSkill.input_lock : previousSkill?.input_lock;
   const questionExitReason = nextSkill?.skill === 'deep-interview' && nextSkill.active === false ? 'abort' : 'handoff';
   const nextState: DeepInterviewModeState = {
+    ...(previousModeState?.tmux_pane_id ? { tmux_pane_id: previousModeState.tmux_pane_id } : {}),
+    ...(previousModeState?.tmux_pane_set_at ? { tmux_pane_set_at: previousModeState.tmux_pane_set_at } : {}),
     active: false,
     mode: 'deep-interview',
     current_phase: preserveCompletedDeepInterviewPhase(previousModeState) || 'completing',
@@ -345,23 +361,78 @@ async function persistStatefulSkillSeedState(
       ? safeString(existingModeState?.started_at).trim() || nowIso
     : nowIso;
 
-  const baseState: Record<string, unknown> = {
-    ...(preserveExistingModeState ? existingModeState : {}),
-    active: true,
-    mode: config.mode,
-    current_phase: preserveExistingModeState
-      ? existingPhase || config.initialPhase
-      : config.initialPhase,
-    started_at: startedAt,
-    updated_at: nowIso,
-    session_id: nextSkill.session_id || safeString(existingModeState?.session_id).trim() || undefined,
-    thread_id: nextSkill.thread_id || safeString(existingModeState?.thread_id).trim() || undefined,
-    turn_id: nextSkill.turn_id || safeString(existingModeState?.turn_id).trim() || undefined,
-  };
+  const baseState: Record<string, unknown> = withModeRuntimeContext(
+    (preserveExistingModeState ? existingModeState : {}) ?? {},
+    {
+      ...(preserveExistingModeState ? existingModeState : {}),
+      ...(existingModeState?.tmux_pane_id ? { tmux_pane_id: existingModeState.tmux_pane_id } : {}),
+      ...(existingModeState?.tmux_pane_set_at ? { tmux_pane_set_at: existingModeState.tmux_pane_set_at } : {}),
+      active: true,
+      mode: config.mode,
+      current_phase: preserveExistingModeState
+        ? existingPhase || config.initialPhase
+        : config.initialPhase,
+      started_at: startedAt,
+      updated_at: nowIso,
+      session_id: nextSkill.session_id || safeString(existingModeState?.session_id).trim() || undefined,
+      thread_id: nextSkill.thread_id || safeString(existingModeState?.thread_id).trim() || undefined,
+      turn_id: nextSkill.turn_id || safeString(existingModeState?.turn_id).trim() || undefined,
+    },
+    { nowIso },
+  );
 
   if (config.includeIteration) {
-    baseState.iteration = typeof existingModeState?.iteration === 'number' ? existingModeState.iteration : 0;
-    baseState.max_iterations = typeof existingModeState?.max_iterations === 'number' ? existingModeState.max_iterations : 50;
+    const defaultIteration = config.mode === 'autopilot' ? 1 : 0;
+    const defaultMaxIterations = config.mode === 'autopilot' ? 10 : 50;
+    baseState.iteration = typeof existingModeState?.iteration === 'number' ? existingModeState.iteration : defaultIteration;
+    baseState.max_iterations = typeof existingModeState?.max_iterations === 'number' ? existingModeState.max_iterations : defaultMaxIterations;
+  }
+
+  if (config.mode === 'autopilot') {
+    const existingState = (existingModeState?.state && typeof existingModeState.state === 'object')
+      ? existingModeState.state as Record<string, unknown>
+      : {};
+    const existingHandoffs = (existingState.handoff_artifacts && typeof existingState.handoff_artifacts === 'object')
+      ? existingState.handoff_artifacts as Record<string, unknown>
+      : {};
+    baseState.review_cycle = typeof existingModeState?.review_cycle === 'number' ? existingModeState.review_cycle : 0;
+    baseState.state = {
+      ...existingState,
+      phase_cycle: Array.isArray(existingState.phase_cycle) ? existingState.phase_cycle : ['deep-interview', 'ralplan', 'ultragoal', 'code-review', 'ultraqa'],
+      handoff_artifacts: {
+        deep_interview: null,
+        ralplan: null,
+        ralplan_consensus_gate: {
+          required: true,
+          sequence: ['architect-review', 'critic-review'],
+          planning_artifacts_are_not_consensus: true,
+          required_review_roles: ['architect', 'critic'],
+          ralplan_architect_review: null,
+          ralplan_critic_review: null,
+          complete: false,
+        },
+        ultragoal: null,
+        code_review: null,
+        ultraqa: null,
+        ...existingHandoffs,
+      },
+      review_verdict: Object.prototype.hasOwnProperty.call(existingState, 'review_verdict')
+        ? existingState.review_verdict
+        : null,
+      qa_verdict: Object.prototype.hasOwnProperty.call(existingState, 'qa_verdict')
+        ? existingState.qa_verdict
+        : null,
+      return_to_ralplan_reason: Object.prototype.hasOwnProperty.call(existingState, 'return_to_ralplan_reason')
+        ? existingState.return_to_ralplan_reason
+        : null,
+      deep_interview_gate: (existingState.deep_interview_gate && typeof existingState.deep_interview_gate === 'object')
+        ? existingState.deep_interview_gate
+        : {
+            status: 'required',
+            skip_reason: null,
+            rationale: 'Autopilot starts at the deep-interview gate by default; clear bounded tasks may skip only with an explicit persisted skip reason.',
+          },
+    };
   }
 
   await mkdir(dirname(absolutePath), { recursive: true });
@@ -397,14 +468,25 @@ const KEYWORD_MAP: Array<{ pattern: RegExp; skill: string; priority: number }> =
   priority: entry.priority,
 }));
 
-const KEYWORDS_REQUIRING_INTENT = new Set(['ralph', 'team', 'swarm', 'stop', 'abort', 'parallel', 'autoresearch']);
+const KEYWORDS_REQUIRING_INTENT = new Set(['ralph', 'team', 'stop', 'abort', 'parallel', 'autoresearch', 'ultragoal']);
 
-type IntentKeyword = 'ralph' | 'team' | 'swarm' | 'stop' | 'abort' | 'parallel' | 'autoresearch';
+type IntentKeyword = 'ralph' | 'team' | 'stop' | 'abort' | 'parallel' | 'autoresearch' | 'ultragoal';
+
+const DEEP_INTERVIEW_ACTIVATION_PATTERNS: RegExp[] = [
+  /(?:^|[^\w])\$(?:deep-interview)\b/i,
+  /\/prompts:deep-interview\b/i,
+  /\b(?:use|run|start|enable|launch|invoke|activate|do|begin)\s+(?:a\s+|an\s+|the\s+)?deep(?:[- ]+)interview\b/i,
+  /^(?:please\s+)?deep(?:[- ]+)interview\b/i,
+  /\bdeep(?:[- ]+)interview\s+(?:this|first|before|me|now)\b/i,
+  /\binterview\s+(?:me|this|the\s+(?:request|task|problem))\b/i,
+];
+
+const DEEP_INTERVIEW_MANAGEMENT_MENTION_PATTERN = /\b(?:clear|cleanup|clean\s+up|remove|reset|delete|fix|debug|report|reported|status|state|lock|unlock|active|inactive|session(?:-scoped)?|scope|scoped|global|legacy|root|mode|workflow)\b/i;
 
 /**
  * Per-keyword intent patterns used when a keyword is in KEYWORDS_REQUIRING_INTENT.
  *
- * "team" / "swarm" require explicit orchestration phrasing so a generic
+ * "team" requires explicit orchestration phrasing so a generic
  * reference in prose doesn't spin up the skill.
  *
  * "stop" / "abort" require a bare imperative or explicit OMX mode reference so
@@ -426,12 +508,6 @@ const KEYWORD_INTENT_PATTERNS: Record<IntentKeyword, RegExp[]> = {
     /\/prompts:team\b/i,
     /\b(?:use|run|start|enable|launch|invoke|activate|orchestrate|coordinate)\s+(?:a\s+|an\s+|the\s+)?team\b/i,
     /\bteam\s+(?:mode|orchestration|workflow|agents?)\b/i,
-  ],
-  swarm: [
-    /(?:^|[^\w])\$(?:swarm)\b/i,
-    /\/prompts:swarm\b/i,
-    /\b(?:use|run|start|enable|launch|invoke|activate|orchestrate|coordinate)\s+(?:a\s+|an\s+|the\s+)?swarm\b/i,
-    /\bswarm\s+(?:mode|orchestration|workflow|agents?)\b/i,
   ],
   stop: [
     /^(?:please\s+)?stop(?:\s+now)?\s*[.!]?\s*$/i,
@@ -463,19 +539,43 @@ const KEYWORD_INTENT_PATTERNS: Record<IntentKeyword, RegExp[]> = {
     /\b(?:use|run|start|enable|launch|invoke|activate)\s+(?:the\s+)?autoresearch\b/i,
     /\bautoresearch\s+(?:mode|workflow|skill|loop)\b/i,
   ],
+  ultragoal: [
+    /(?:^|[^\w])\$(?:ultragoal)\b/i,
+    /^\s*\/ultragoal\b/i,
+    /\b(?:use|run|start|enable|launch|invoke|activate|resume|continue)\s+(?:the\s+)?ultragoal\b/i,
+    /\bultragoal\s+(?:mode|workflow|skill|loop|plan|goals?)\b/i,
+  ],
 };
 
 function hasExplicitPromptsInvocation(text: string): boolean {
   return /(?:^|\s)\/prompts:[\w.-]+(?=[\s.,!?;:]|$)/i.test(text);
 }
 
-function hasExplicitSkillLikeInvocation(text: string): boolean {
-  return /(?:^|[^\w])\$([a-z][a-z0-9-]*)\b/i.test(text);
+/**
+ * Korean 2-set keyboard typo aliases for workflow keywords.
+ *
+ * Keep this intentionally narrow: only the `ulw` ultrawork shorthand is
+ * normalized so users who forget to switch IMEs get the same activation path
+ * as the canonical keyword without introducing broad transliteration surprises.
+ */
+function normalizeWorkflowKeyboardTypos(text: string): string {
+  return text.replace(/ㅕㅣㅈ/g, 'ulw');
 }
 
-function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
+interface ExplicitSkillParseResult {
+  matches: KeywordMatch[];
+  sawExplicitLikeInvocation: boolean;
+}
+
+function normalizeExplicitSkillToken(token: string): string {
+  if (token === 'ulw') return 'ultrawork';
+  if (token === 'frontend-ui-ux') return 'design';
+  return token;
+}
+
+function parseExplicitSkillInvocations(text: string): ExplicitSkillParseResult {
   const results: KeywordMatch[] = [];
-  const regex = /(?:^|[^\w])\$([a-z][a-z0-9-]*)\b/gi;
+  const regex = /(?:^|[^\w])\$(?:(?:oh-my-codex:)?([a-z][a-z0-9-]*))\b/gi;
   let match: RegExpExecArray | null;
   let captureStarted = false;
   let lastMatchEnd = -1;
@@ -483,11 +583,9 @@ function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
   while ((match = regex.exec(text)) !== null) {
     const token = (match[1] ?? '').toLowerCase();
     if (!token) continue;
-
-    const normalizedSkill = token === 'swarm' ? 'team' : token;
+    const rawKeyword = match[0].slice(match[0].lastIndexOf('$')).toLowerCase();
+    const normalizedSkill = normalizeExplicitSkillToken(token);
     const registryEntry = KEYWORD_TRIGGER_DEFINITIONS.find((entry) => entry.skill.toLowerCase() === normalizedSkill);
-    if (!registryEntry) continue;
-
     const matchStart = match.index + match[0].lastIndexOf('$');
     if (captureStarted) {
       const between = text.slice(lastMatchEnd, matchStart);
@@ -495,22 +593,33 @@ function extractExplicitSkillInvocations(text: string): KeywordMatch[] {
     }
 
     captureStarted = true;
-    lastMatchEnd = matchStart + token.length + 1;
+    lastMatchEnd = matchStart + rawKeyword.length;
+    if (!registryEntry) continue;
 
     if (results.some((item) => item.skill === normalizedSkill)) continue;
 
     results.push({
-      keyword: `$${token}`,
+      keyword: rawKeyword,
       skill: normalizedSkill,
       priority: registryEntry.priority,
     });
   }
 
-  return results;
+  return {
+    matches: results,
+    sawExplicitLikeInvocation: captureStarted,
+  };
 }
 
 function hasIntentContextForKeyword(text: string, keyword: string): boolean {
   const k = keyword.toLowerCase();
+  if (k === 'deep interview' || k === 'interview') {
+    if (DEEP_INTERVIEW_MANAGEMENT_MENTION_PATTERN.test(text)
+      && !DEEP_INTERVIEW_ACTIVATION_PATTERNS.some((pattern) => pattern.test(text))) {
+      return false;
+    }
+    return DEEP_INTERVIEW_ACTIVATION_PATTERNS.some((pattern) => pattern.test(text));
+  }
   if (!KEYWORDS_REQUIRING_INTENT.has(k)) return true;
   const patterns = KEYWORD_INTENT_PATTERNS[k as IntentKeyword];
   return patterns.some((pattern) => pattern.test(text));
@@ -522,11 +631,13 @@ function hasIntentContextForKeyword(text: string, keyword: string): boolean {
  * then appends implicit keyword matches sorted by priority.
  */
 export function detectKeywords(text: string): KeywordMatch[] {
-  const explicit = extractExplicitSkillInvocations(text);
-  if (hasExplicitPromptsInvocation(text) && explicit.length === 0) {
+  const normalizedText = normalizeWorkflowKeyboardTypos(text);
+  const explicitParse = parseExplicitSkillInvocations(normalizedText);
+  const explicit = explicitParse.matches;
+  if (hasExplicitPromptsInvocation(normalizedText) && explicit.length === 0) {
     return [];
   }
-  if (explicit.length === 0 && hasExplicitSkillLikeInvocation(text)) {
+  if (explicit.length === 0 && explicitParse.sawExplicitLikeInvocation) {
     return [];
   }
   if (explicit.length > 0) {
@@ -536,9 +647,9 @@ export function detectKeywords(text: string): KeywordMatch[] {
   const implicit: KeywordMatch[] = [];
 
   for (const { pattern, skill, priority } of KEYWORD_MAP) {
-    const match = text.match(pattern);
+    const match = normalizedText.match(pattern);
     if (match) {
-      if (!hasIntentContextForKeyword(text, match[0].toLowerCase())) continue;
+      if (!hasIntentContextForKeyword(normalizedText, match[0].toLowerCase())) continue;
       implicit.push({
         keyword: match[0],
         skill,
@@ -603,7 +714,7 @@ function resolveContinuationKeywordMatch(
     return fallbackMatch;
   }
 
-  if (extractExplicitSkillInvocations(text).length > 0) {
+  if (parseExplicitSkillInvocations(normalizeWorkflowKeyboardTypos(text)).sawExplicitLikeInvocation) {
     return fallbackMatch;
   }
 
@@ -619,7 +730,9 @@ function resolveContinuationKeywordMatch(
 }
 
 function initialWorkflowPhaseForMode(mode: TrackedWorkflowMode): SkillActivePhase {
-  return mode === 'autoresearch' ? 'executing' : 'planning';
+  if (mode === 'autoresearch') return 'executing';
+  if (mode === 'autopilot') return 'deep-interview';
+  return 'planning';
 }
 
 function resolveRequestedWorkflowSkills(requestedWorkflowSkills: TrackedWorkflowMode[]): {
@@ -649,18 +762,18 @@ function selectRootSkillStateCopy(
 ): SkillActiveState | null | undefined {
   if (!sessionId) return nextState;
   if (previousRoot) return previousRoot;
-  if (nextState.skill === 'ralph') return null;
-  return nextState;
+  return null;
 }
 
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+  const sourceCwd = input.sourceCwd ?? dirname(dirname(input.stateDir));
   const rootStatePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
   const sessionStatePath = input.sessionId
     ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
     : null;
   const previousRoot = await readExistingSkillState(rootStatePath);
   const previousSession = sessionStatePath ? await readExistingSkillState(sessionStatePath) : null;
-  const previous = previousSession ?? previousRoot;
+  const previous = input.sessionId ? previousSession : previousRoot;
   const match = resolveContinuationKeywordMatch(
     input.text,
     previous,
@@ -691,8 +804,8 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     };
 
     try {
-      await writeSkillActiveStateCopies(
-        dirname(dirname(input.stateDir)),
+      await writeSkillActiveStateCopiesForStateDir(
+        input.stateDir,
         state,
         input.sessionId,
         selectRootSkillStateCopy(previousRoot, state, input.sessionId),
@@ -724,7 +837,8 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     : releaseDeepInterviewInputLock(previous?.input_lock, nowIso);
 
   if (isTrackedWorkflowMode(match.skill)) {
-    const workflowMatches = extractExplicitSkillInvocations(input.text)
+    const normalizedInputText = normalizeWorkflowKeyboardTypos(input.text);
+    const workflowMatches = parseExplicitSkillInvocations(normalizedInputText).matches
       .map((entry) => entry.skill)
       .filter(isTrackedWorkflowMode);
     const { requestedSkills: requestedWorkflowSkills, deferredSkills } = resolveRequestedWorkflowSkills(
@@ -764,12 +878,13 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 
       if (decision.autoCompleteModes.length > 0) {
         const transition = await reconcileWorkflowTransition(
-          dirname(dirname(input.stateDir)),
+          sourceCwd,
           requestedMode,
           {
             action: 'activate',
             sessionId: input.sessionId,
             source: 'keyword-detector',
+            baseStateDir: input.stateDir,
             currentModes: nextWorkflowEntries.map((entry) => entry.skill),
           },
         );
@@ -863,8 +978,8 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         }
       }
       nextState.active_skills = buildActiveSkills(nextState);
-      await writeSkillActiveStateCopies(
-        dirname(dirname(input.stateDir)),
+      await writeSkillActiveStateCopiesForStateDir(
+        input.stateDir,
         nextState,
         input.sessionId,
         selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
@@ -906,8 +1021,8 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   try {
     const nextState = await persistStatefulSkillSeedState(input.stateDir, state, nowIso, previous);
     nextState.active_skills = buildActiveSkills(nextState);
-    await writeSkillActiveStateCopies(
-      dirname(dirname(input.stateDir)),
+    await writeSkillActiveStateCopiesForStateDir(
+      input.stateDir,
       nextState,
       input.sessionId,
       selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
@@ -1000,7 +1115,7 @@ export function isUnderspecifiedForExecution(text: string): boolean {
 
   // Strip mode keywords for effective word counting
   const stripped = trimmed
-    .replace(/\b(?:ralph|autopilot|team|ultrawork|ulw|swarm)\b/gi, '')
+    .replace(/\b(?:ralph|autopilot|team|ultrawork|ulw)\b/gi, '')
     .trim();
   const effectiveWords = stripped.split(/\s+/).filter(w => w.length > 0).length;
 
@@ -1052,14 +1167,14 @@ export function applyRalplanGate(
   }
 
   const planningComplete = isPlanningComplete(readPlanningArtifacts(options.cwd ?? process.cwd()));
+  const consensusComplete = hasDurableRalplanConsensusEvidenceForCwd(options.cwd ?? process.cwd());
   const shortFollowupBypasses = executionKeywords.filter((keyword) => {
-    const normalizedKeyword = keyword === 'swarm' ? 'team' : keyword;
-    if (normalizedKeyword !== 'team' && normalizedKeyword !== 'ralph') return false;
+    if (keyword !== 'team' && keyword !== 'ralph') return false;
     return isApprovedExecutionFollowupShortcut(
-      normalizedKeyword as FollowupMode,
+      keyword as FollowupMode,
       text,
       {
-        planningComplete,
+        planningComplete: planningComplete && consensusComplete,
         priorSkill: options.priorSkill,
       },
     );

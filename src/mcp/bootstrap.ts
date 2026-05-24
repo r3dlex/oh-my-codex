@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { resolveOmxFirstPartyMcpEntrypointForPluginTarget } from '../config/omx-first-party-mcp.js';
+import { writeMcpLifecycleTelemetry } from './lifecycle-telemetry.js';
 
-export type McpServerName = 'state' | 'memory' | 'code_intel' | 'trace' | 'wiki';
+export type McpServerName = 'state' | 'memory' | 'code_intel' | 'trace' | 'wiki' | 'hermes';
 
 const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
   state: 'OMX_STATE_SERVER_DISABLE_AUTO_START',
@@ -9,15 +11,27 @@ const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
   code_intel: 'OMX_CODE_INTEL_SERVER_DISABLE_AUTO_START',
   trace: 'OMX_TRACE_SERVER_DISABLE_AUTO_START',
   wiki: 'OMX_WIKI_SERVER_DISABLE_AUTO_START',
+  hermes: 'OMX_HERMES_SERVER_DISABLE_AUTO_START',
 };
 
 const GLOBAL_DISABLE_ENV = 'OMX_MCP_SERVER_DISABLE_AUTO_START';
 const LIFECYCLE_DEBUG_ENV = 'OMX_MCP_TRANSPORT_DEBUG';
-const PARENT_WATCHDOG_INTERVAL_MS = 25;
-const DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS = 5_000;
-const DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS = 2_000;
-const DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS = 300_000;
+const PARENT_WATCHDOG_INTERVAL_ENV = 'OMX_MCP_PARENT_WATCHDOG_INTERVAL_MS';
+const DUPLICATE_SIBLING_WATCHDOG_INTERVAL_ENV = 'OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS';
+const DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_ENV = 'OMX_MCP_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS';
+const DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_ENV = 'OMX_MCP_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS';
+const DUPLICATE_SIBLING_INITIAL_DELAY_ENV = 'OMX_MCP_DUPLICATE_SIBLING_INITIAL_DELAY_MS';
+const DUPLICATE_SIBLING_INITIAL_DELAY_MAX_ENV = 'OMX_MCP_DUPLICATE_SIBLING_INITIAL_DELAY_MAX_MS';
+const MAX_SIBLINGS_PER_ENTRYPOINT_ENV = 'OMX_MCP_MAX_SIBLINGS_PER_ENTRYPOINT';
+export const MCP_ENTRYPOINT_MARKER_ENV = 'OMX_MCP_ENTRYPOINT_MARKER';
+const DEFAULT_PARENT_WATCHDOG_INTERVAL_MS = 1_000;
+const DEFAULT_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS = 5_000;
+const DEFAULT_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS = 2_000;
+const DEFAULT_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS = 60_000;
+const DEFAULT_DUPLICATE_SIBLING_INITIAL_DELAY_MAX_MS = 1_000;
+const DEFAULT_MAX_SIBLINGS_PER_ENTRYPOINT = 4;
 const MCP_ENTRYPOINT_PATTERN = /\b([a-z0-9-]+-server\.(?:[cm]?js|ts))\b/i;
+const MCP_SERVE_TARGET_PATTERN = /(?:^|\s)mcp-serve\s+([^\s]+)/i;
 
 interface StdioLifecycleServer {
   connect(transport: StdioServerTransport): Promise<unknown>;
@@ -37,13 +51,47 @@ export interface DuplicateSiblingObservation {
   newerSiblingPids: number[];
 }
 
+interface LifecycleTimingConfig {
+  parentWatchdogIntervalMs: number;
+  duplicateSiblingWatchdogIntervalMs: number;
+  duplicateSiblingPreTrafficGraceMs: number;
+  duplicateSiblingPostTrafficIdleMs: number;
+  duplicateSiblingInitialDelayMs: number | null;
+  duplicateSiblingInitialDelayMaxMs: number;
+  maxSiblingsPerEntrypoint: number;
+}
+
+const SERVER_ENTRYPOINT: Record<McpServerName, string> = {
+  state: 'state-server.js',
+  memory: 'memory-server.js',
+  code_intel: 'code-intel-server.js',
+  trace: 'trace-server.js',
+  wiki: 'wiki-server.js',
+  hermes: 'hermes-server.js',
+};
+
 function normalizeCommand(command: string): string {
   return command.replace(/\\+/g, '/').trim();
 }
 
 export function extractMcpEntrypointMarker(command: string): string | null {
-  const match = normalizeCommand(command).match(MCP_ENTRYPOINT_PATTERN);
-  return match?.[1]?.toLowerCase() ?? null;
+  const normalizedCommand = normalizeCommand(command);
+  const entrypointMatch = normalizedCommand.match(MCP_ENTRYPOINT_PATTERN);
+  if (entrypointMatch?.[1]) return entrypointMatch[1].toLowerCase();
+
+  const mcpServeMatch = normalizedCommand.match(MCP_SERVE_TARGET_PATTERN);
+  return resolveOmxFirstPartyMcpEntrypointForPluginTarget(mcpServeMatch?.[1]);
+}
+
+export function resolveCurrentMcpEntrypointMarker(
+  env: Record<string, string | undefined> = process.env,
+  argv1: string | undefined = process.argv[1],
+): string | null {
+  const explicitMarker = extractMcpEntrypointMarker(
+    env[MCP_ENTRYPOINT_MARKER_ENV] ?? '',
+  );
+  if (explicitMarker) return explicitMarker;
+  return extractMcpEntrypointMarker(argv1 ?? '');
 }
 
 export function parseProcessTable(output: string): ProcessTableEntry[] {
@@ -65,11 +113,99 @@ export function parseProcessTable(output: string): ProcessTableEntry[] {
     .filter((entry): entry is ProcessTableEntry => entry !== null);
 }
 
-export function listProcessTable(
-  readPs: typeof execFileSync = execFileSync,
-): ProcessTableEntry[] | null {
-  if (process.platform === 'win32') {
+const WINDOWS_PROCESS_TABLE_TIMEOUT_MS = 2_000;
+const WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+type ProcessTableReader = typeof execFileSync;
+
+interface WindowsProcessRecord {
+  ProcessId?: unknown;
+  ParentProcessId?: unknown;
+  CommandLine?: unknown;
+  Name?: unknown;
+}
+
+function parsePositiveInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseNonNegativeInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+export function parseWindowsProcessTable(output: string): ProcessTableEntry[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
     return null;
+  }
+
+  const records = Array.isArray(parsed) ? parsed : [parsed];
+  const entries: ProcessTableEntry[] = [];
+
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const processRecord = record as WindowsProcessRecord;
+    const pid = parsePositiveInteger(processRecord.ProcessId);
+    const ppid = parseNonNegativeInteger(processRecord.ParentProcessId);
+    const rawCommand = typeof processRecord.CommandLine === 'string' && processRecord.CommandLine.trim()
+      ? processRecord.CommandLine
+      : typeof processRecord.Name === 'string'
+        ? processRecord.Name
+        : '';
+    const command = rawCommand.trim();
+
+    if (pid === null || ppid === null || !command) continue;
+    entries.push({ pid, ppid, command });
+  }
+
+  return entries;
+}
+
+function listWindowsProcessTable(
+  readProcessTable: ProcessTableReader,
+): ProcessTableEntry[] | null {
+  try {
+    const output = readProcessTable(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,Name | ConvertTo-Json -Compress',
+      ],
+      {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: WINDOWS_PROCESS_TABLE_TIMEOUT_MS,
+        maxBuffer: WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES,
+      },
+    );
+    return parseWindowsProcessTable(output);
+  } catch {
+    return null;
+  }
+}
+
+export function listProcessTable(
+  readPs: ProcessTableReader = execFileSync,
+  platform: NodeJS.Platform = process.platform,
+): ProcessTableEntry[] | null {
+  if (platform === 'win32') {
+    return listWindowsProcessTable(readPs);
   }
 
   try {
@@ -153,13 +289,99 @@ export function analyzeDuplicateSiblingState(
   };
 }
 
+function readNonNegativeIntegerEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number | null,
+): number | null {
+  const raw = env[name];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function readPositiveIntegerEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const raw = env[name];
+  if (typeof raw !== 'string' || raw.trim() === '') return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resolveLifecycleTimingConfig(
+  env: Record<string, string | undefined>,
+): LifecycleTimingConfig {
+  return {
+    parentWatchdogIntervalMs: readPositiveIntegerEnv(
+      env,
+      PARENT_WATCHDOG_INTERVAL_ENV,
+      DEFAULT_PARENT_WATCHDOG_INTERVAL_MS,
+    ),
+    duplicateSiblingWatchdogIntervalMs: readPositiveIntegerEnv(
+      env,
+      DUPLICATE_SIBLING_WATCHDOG_INTERVAL_ENV,
+      DEFAULT_DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS,
+    ),
+    duplicateSiblingPreTrafficGraceMs: readPositiveIntegerEnv(
+      env,
+      DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_ENV,
+      DEFAULT_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS,
+    ),
+    duplicateSiblingPostTrafficIdleMs: readPositiveIntegerEnv(
+      env,
+      DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_ENV,
+      DEFAULT_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS,
+    ),
+    duplicateSiblingInitialDelayMs: readNonNegativeIntegerEnv(
+      env,
+      DUPLICATE_SIBLING_INITIAL_DELAY_ENV,
+      null,
+    ),
+    duplicateSiblingInitialDelayMaxMs: readPositiveIntegerEnv(
+      env,
+      DUPLICATE_SIBLING_INITIAL_DELAY_MAX_ENV,
+      DEFAULT_DUPLICATE_SIBLING_INITIAL_DELAY_MAX_MS,
+    ),
+    maxSiblingsPerEntrypoint: readNonNegativeIntegerEnv(
+      env,
+      MAX_SIBLINGS_PER_ENTRYPOINT_ENV,
+      DEFAULT_MAX_SIBLINGS_PER_ENTRYPOINT,
+    ) ?? DEFAULT_MAX_SIBLINGS_PER_ENTRYPOINT,
+  };
+}
+
+function stableStringHash(value: string): number {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = ((hash * 31) + value.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+export function resolveDuplicateSiblingWatchdogInitialDelayMs(
+  serverName: McpServerName,
+  entrypoint: string | null,
+  config: Pick<LifecycleTimingConfig, 'duplicateSiblingInitialDelayMs' | 'duplicateSiblingInitialDelayMaxMs'>,
+): number {
+  if (typeof config.duplicateSiblingInitialDelayMs === 'number') {
+    return Math.max(0, config.duplicateSiblingInitialDelayMs);
+  }
+
+  const maxMs = Math.max(0, config.duplicateSiblingInitialDelayMaxMs);
+  if (maxMs <= 0) return 0;
+  return stableStringHash(`${serverName}:${entrypoint ?? 'unknown'}`) % (maxMs + 1);
+}
+
 export function shouldSelfExitForDuplicateSibling(
   observation: DuplicateSiblingObservation,
   nowMs: number,
   duplicateObservedAtMs: number | null,
   lastTrafficAtMs: number | null,
-  preTrafficGraceMs = DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS,
-  postTrafficIdleMs = DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS,
+  preTrafficGraceMs = DEFAULT_DUPLICATE_SIBLING_PRE_TRAFFIC_GRACE_MS,
+  postTrafficIdleMs = DEFAULT_DUPLICATE_SIBLING_POST_TRAFFIC_IDLE_MS,
 ): boolean {
   if (observation.status !== 'older_duplicate') {
     return false;
@@ -168,16 +390,39 @@ export function shouldSelfExitForDuplicateSibling(
     return false;
   }
 
-  if (lastTrafficAtMs === null) {
-    return nowMs - duplicateObservedAtMs >= preTrafficGraceMs;
-  }
-
-  if (!Number.isFinite(lastTrafficAtMs) || lastTrafficAtMs > nowMs) {
+  if (lastTrafficAtMs !== null && (!Number.isFinite(lastTrafficAtMs) || lastTrafficAtMs > nowMs)) {
     return false;
   }
 
-  const safeIdleAnchorMs = Math.max(lastTrafficAtMs, duplicateObservedAtMs);
-  return nowMs - safeIdleAnchorMs >= postTrafficIdleMs;
+  if (lastTrafficAtMs !== null) {
+    // Stdio traffic means a client initialized or otherwise owned this transport.
+    // Keep that protection, but do not make it permanent: Codex.app can reuse a
+    // long-lived parent across sessions, leaving initialized older siblings alive
+    // after a newer server for the same first-party entrypoint has taken over.
+    // Require a conservative idle window after both the duplicate observation and
+    // the most recent traffic before self-exiting.
+    const idleSinceMs = Math.max(duplicateObservedAtMs, lastTrafficAtMs);
+    return nowMs - idleSinceMs >= postTrafficIdleMs;
+  }
+
+  return nowMs - duplicateObservedAtMs >= preTrafficGraceMs;
+}
+
+export function shouldSelfExitForPreTrafficSiblingHardCap(
+  observation: DuplicateSiblingObservation,
+  lastTrafficAtMs: number | null,
+  maxSiblingsPerEntrypoint = DEFAULT_MAX_SIBLINGS_PER_ENTRYPOINT,
+): boolean {
+  if (observation.status !== 'older_duplicate') return false;
+  if (lastTrafficAtMs !== null) return false;
+  if (!Number.isInteger(maxSiblingsPerEntrypoint) || maxSiblingsPerEntrypoint <= 0) return false;
+  if (observation.matchingPids.length <= maxSiblingsPerEntrypoint) return false;
+
+  // Keep the newest N same-parent same-entrypoint siblings and let only older
+  // never-owned transports self-exit. Once a server has seen any stdin byte,
+  // this hard cap no longer applies; the conservative post-traffic idle window
+  // remains responsible for initialized transports.
+  return observation.newerSiblingPids.length >= maxSiblingsPerEntrypoint;
 }
 
 export function isParentProcessAlive(
@@ -217,8 +462,13 @@ export function autoStartStdioMcpServer(
   const transport = new StdioServerTransport();
   let shuttingDown = false;
   const lifecycleDebugEnabled = env[LIFECYCLE_DEBUG_ENV] === '1';
+  const lifecycleTiming = resolveLifecycleTimingConfig(env);
   const trackedParentPid = Number.isInteger(process.ppid) ? process.ppid : 0;
-  const trackedEntrypoint = extractMcpEntrypointMarker(process.argv[1] ?? '');
+  const resolvedEntrypoint = resolveCurrentMcpEntrypointMarker(
+    env,
+    process.argv[1] ?? '',
+  );
+  const trackedEntrypoint = resolvedEntrypoint ?? SERVER_ENTRYPOINT[serverName];
   let lastTrafficAtMs: number | null = null;
   let duplicateObservedAtMs: number | null = null;
 
@@ -228,16 +478,51 @@ export function autoStartStdioMcpServer(
     process.stderr.write(`[omx-${serverName}-server] ${message}${detail}\n`);
   };
 
+  const emitLifecycle = (
+    event: string,
+    detail: Record<string, unknown> = {},
+  ) => {
+    writeMcpLifecycleTelemetry({
+      event,
+      server: serverName,
+      entrypoint: trackedEntrypoint,
+      pid: process.pid,
+      ppid: trackedParentPid,
+      ...detail,
+    }, env);
+  };
+
+  emitLifecycle('bootstrap_start', {
+    resolved_entrypoint: resolvedEntrypoint,
+    argv0: process.argv[0],
+    argv1: process.argv[1],
+    argv2: process.argv[2],
+    env_entrypoint_marker: env[MCP_ENTRYPOINT_MARKER_ENV],
+  });
+
+  if (!resolvedEntrypoint) {
+    emitLifecycle('marker_resolution_failed', {
+      fallback_entrypoint: trackedEntrypoint,
+      argv0: process.argv[0],
+      argv1: process.argv[1],
+      argv2: process.argv[2],
+      env_entrypoint_marker: env[MCP_ENTRYPOINT_MARKER_ENV],
+    });
+  }
+
   const parentWatchdog = trackedParentPid > 1
     ? setInterval(() => {
       if (!isParentProcessAlive(trackedParentPid)) {
         void shutdown('parent_gone');
       }
-    }, PARENT_WATCHDOG_INTERVAL_MS)
+    }, lifecycleTiming.parentWatchdogIntervalMs)
     : null;
   parentWatchdog?.unref();
-  const duplicateSiblingWatchdog = trackedParentPid > 1 && trackedEntrypoint
-    ? setInterval(() => {
+  let duplicateSiblingWatchdog: ReturnType<typeof setInterval> | null = null;
+  let duplicateSiblingInitialDelayTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const runDuplicateSiblingWatchdog = () => {
+    try {
       const processes = listProcessTable();
       if (!processes) {
         duplicateObservedAtMs = null;
@@ -256,23 +541,68 @@ export function autoStartStdioMcpServer(
         return;
       }
 
+      const firstObservation = duplicateObservedAtMs === null;
       duplicateObservedAtMs ??= Date.now();
+      if (firstObservation) {
+        emitLifecycle('duplicate_sibling_observed', {
+          matching_pids: observation.matchingPids,
+          newer_sibling_pids: observation.newerSiblingPids,
+          last_traffic_at_ms: lastTrafficAtMs,
+          max_siblings_per_entrypoint: lifecycleTiming.maxSiblingsPerEntrypoint,
+        });
+      }
+
+      if (shouldSelfExitForPreTrafficSiblingHardCap(
+        observation,
+        lastTrafficAtMs,
+        lifecycleTiming.maxSiblingsPerEntrypoint,
+      )) {
+        void shutdown('superseded_hard_cap_pre_traffic');
+        return;
+      }
+
       if (!shouldSelfExitForDuplicateSibling(
         observation,
         Date.now(),
         duplicateObservedAtMs,
         lastTrafficAtMs,
+        lifecycleTiming.duplicateSiblingPreTrafficGraceMs,
+        lifecycleTiming.duplicateSiblingPostTrafficIdleMs,
       )) {
         return;
       }
 
-      const reason = lastTrafficAtMs === null
-        ? 'superseded_duplicate_before_traffic'
-        : 'superseded_duplicate_idle';
-      void shutdown(reason);
-    }, DUPLICATE_SIBLING_WATCHDOG_INTERVAL_MS)
-    : null;
-  duplicateSiblingWatchdog?.unref();
+      void shutdown(
+        lastTrafficAtMs !== null && lastTrafficAtMs > duplicateObservedAtMs
+          ? 'superseded_duplicate_after_idle'
+          : 'superseded_duplicate_before_traffic',
+      );
+    } catch (error) {
+      duplicateObservedAtMs = null;
+      logLifecycle('duplicate sibling watchdog failed', error);
+      emitLifecycle('duplicate_watchdog_error', {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  if (trackedParentPid > 1 && trackedEntrypoint) {
+    const initialDelayMs = resolveDuplicateSiblingWatchdogInitialDelayMs(
+      serverName,
+      trackedEntrypoint,
+      lifecycleTiming,
+    );
+    duplicateSiblingInitialDelayTimer = setTimeout(() => {
+      duplicateSiblingInitialDelayTimer = null;
+      runDuplicateSiblingWatchdog();
+      duplicateSiblingWatchdog = setInterval(
+        runDuplicateSiblingWatchdog,
+        lifecycleTiming.duplicateSiblingWatchdogIntervalMs,
+      );
+      duplicateSiblingWatchdog.unref();
+    }, initialDelayMs);
+    duplicateSiblingInitialDelayTimer.unref();
+  }
 
   const shutdown = async (reason: string) => {
     if (shuttingDown) {
@@ -280,8 +610,16 @@ export function autoStartStdioMcpServer(
     }
     shuttingDown = true;
     logLifecycle(`transport shutdown: ${reason}`);
+    emitLifecycle('shutdown', {
+      reason,
+      last_traffic_at_ms: lastTrafficAtMs,
+      duplicate_observed_at_ms: duplicateObservedAtMs,
+    });
     if (parentWatchdog) {
       clearInterval(parentWatchdog);
+    }
+    if (duplicateSiblingInitialDelayTimer) {
+      clearTimeout(duplicateSiblingInitialDelayTimer);
     }
     if (duplicateSiblingWatchdog) {
       clearInterval(duplicateSiblingWatchdog);

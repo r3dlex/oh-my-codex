@@ -7,8 +7,13 @@ import { existsSync, readFileSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { AGENT_DEFINITIONS, AgentDefinition } from "./definitions.js";
+import { readCatalogManifest } from "../catalog/reader.js";
+import type { CatalogManifest } from "../catalog/schema.js";
+import { getInstallableNativeAgentNames } from "./policy.js";
 import {
+  getCodexConfigRootModelProvider,
   getEnvConfiguredStandardDefaultModel,
+  getAgentReasoningOverride,
   getMainDefaultModel,
   getSparkDefaultModel,
   getStandardDefaultModel,
@@ -17,6 +22,7 @@ import { getRootModelName } from "../config/generator.js";
 import { codexAgentsDir } from "../utils/paths.js";
 
 export const EXACT_GPT_5_4_MINI_MODEL = "gpt-5.4-mini";
+export const EXACT_RESEARCHER_MODEL = EXACT_GPT_5_4_MINI_MODEL;
 
 const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
   "frontier-orchestrator": [
@@ -102,6 +108,7 @@ export interface GeneratedNativeAgentConfig {
   description: string;
   developerInstructions?: string;
   model?: string;
+  modelProvider?: string;
   reasoningEffort?: "low" | "medium" | "high" | "xhigh";
 }
 
@@ -153,6 +160,10 @@ function resolveAgentModel(
   agent: AgentDefinition,
   options: AgentModelResolutionOptions = {},
 ): string {
+  if (agent.name === "researcher") {
+    return EXACT_RESEARCHER_MODEL;
+  }
+
   if (agent.name === "executor") {
     return resolveFrontierModel(options);
   }
@@ -271,6 +282,9 @@ export function generateStandaloneAgentToml(
   if (config.model) {
     lines.push(`model = "${escapeTomlBasicString(config.model)}"`);
   }
+  if (config.modelProvider) {
+    lines.push(`model_provider = "${escapeTomlBasicString(config.modelProvider)}"`);
+  }
   if (config.reasoningEffort) {
     lines.push(`model_reasoning_effort = "${config.reasoningEffort}"`);
   }
@@ -297,12 +311,15 @@ export function generateAgentToml(
   options: AgentModelResolutionOptions = {},
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
+  const resolvedModelProvider = getCodexConfigRootModelProvider(options.codexHomeOverride);
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,
     developerInstructions: composeRoleInstructions(promptContent, agent, resolvedModel),
     model: resolvedModel,
-    reasoningEffort: agent.reasoningEffort,
+    modelProvider: resolvedModelProvider,
+    reasoningEffort: getAgentReasoningOverride(agent.name, options.codexHomeOverride)
+      ?? agent.reasoningEffort,
   });
 }
 
@@ -317,6 +334,8 @@ export async function installNativeAgentConfigs(
     dryRun?: boolean;
     verbose?: boolean;
     agentsDir?: string;
+    catalogManifest?: CatalogManifest;
+    allowUncatalogedDefinitions?: boolean;
   } = {},
 ): Promise<number> {
   const {
@@ -324,6 +343,8 @@ export async function installNativeAgentConfigs(
     dryRun = false,
     verbose = false,
     agentsDir = codexAgentsDir(),
+    catalogManifest,
+    allowUncatalogedDefinitions = false,
   } = options;
   const codexHomeOverride = join(agentsDir, "..");
 
@@ -333,7 +354,16 @@ export async function installNativeAgentConfigs(
 
   let count = 0;
 
-  for (const [name, agent] of Object.entries(AGENT_DEFINITIONS)) {
+  const installableAgentNames = allowUncatalogedDefinitions
+    ? new Set(Object.keys(AGENT_DEFINITIONS))
+    : getInstallableNativeAgentNames(catalogManifest ?? readCatalogManifest(pkgRoot));
+
+  for (const name of [...installableAgentNames].sort()) {
+    const agent = AGENT_DEFINITIONS[name];
+    if (!agent) {
+      if (verbose) console.log(`  skip ${name} (no agent definition)`);
+      continue;
+    }
     const promptPath = join(pkgRoot, "prompts", `${name}.md`);
     if (!existsSync(promptPath)) {
       if (verbose) console.log(`  skip ${name} (no prompt file)`);

@@ -24,7 +24,7 @@ Examples:
 - `.omx/state/sessions/<session_id>/ralph-state.json`
 - `.omx/state/team-state.json`
 
-These files determine whether a workflow mode is active, completed, cancelled, or failed.
+These files determine whether a workflow mode is active, completed, cancelled, or failed. Those mode phases are not always identical to the user-facing terminal lifecycle vocabulary; see the explicit terminal lifecycle section below for that compatibility boundary.
 
 ### 2. `skill-active-state.json` — compatibility / visibility layer
 
@@ -44,6 +44,33 @@ Read precedence is:
 3. root scope fallback
 
 If root and session disagree for the same mode, session wins for the active execution context, but stale root survivors should be terminalized during reconciliation when they would otherwise resurrect old state.
+
+## Terminal lifecycle outcome compatibility
+
+For the explicit terminal stop model, treat workflow `current_phase` and user-facing terminal lifecycle outcome as related but separate concepts.
+
+Canonical user-facing lifecycle outcomes are:
+
+- `finished`
+- `blocked`
+- `failed`
+- `userinterlude`
+- `askuserQuestion`
+
+Compatibility rules:
+
+- Prefer a dedicated canonical lifecycle field over legacy `run_outcome` when both exist.
+- Treat legacy `run_outcome` as a compatibility layer during migration.
+- Infer from `current_phase` only when neither canonical lifecycle metadata nor legacy `run_outcome` is available.
+- Keep `cancelled` as an internal legacy/admin phase, not as the canonical public lifecycle vocabulary.
+
+Recommended read precedence for terminal lifecycle interpretation:
+
+1. canonical lifecycle metadata (for example `lifecycle_outcome`)
+2. legacy `run_outcome`
+3. compatibility inference from `current_phase`, question metadata, and persisted error/completion fields
+
+`blocked_on_user` is also compatibility-only. When surrounding question metadata proves OMX asked a blocking question, classify it as `askuserQuestion`; otherwise treat it as a user-wait compatibility signal instead of exposing it as the canonical vocabulary directly.
 
 ## Core files
 
@@ -119,6 +146,7 @@ Current allowlisted forward handoffs:
 - `ralplan -> team`
 - `ralplan -> ralph`
 - `ralplan -> autopilot`
+- `autopilot -> ralplan` when Autopilot's code-review phase is not clean
 
 ### D. Deny
 
@@ -132,11 +160,12 @@ The requested transition is not allowed and no state is changed.
 | `ralplan` | `team` | auto-complete `ralplan`, start `team` |
 | `ralplan` | `ralph` | auto-complete `ralplan`, start `ralph` |
 | `ralplan` | `autopilot` | auto-complete `ralplan`, start `autopilot` |
+| `autopilot` | `ralplan` | auto-complete `autopilot`, start `ralplan` for review-driven loopback |
 | `team` | `ralph` | allowed overlap |
 | `ralph` | `team` | allowed overlap |
 | `<any tracked mode>` | `ultrawork` | allowed overlap |
 | `ultrawork` | `<any tracked mode>` | allowed overlap |
-| execution-like mode | planning-like mode | denied rollback auto-complete |
+| execution-like mode | planning-like mode | denied rollback auto-complete, except the explicit `autopilot -> ralplan` review loopback |
 | anything else non-allowlisted | new conflicting mode | denied |
 
 ## Planning-like vs execution-like

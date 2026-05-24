@@ -65,7 +65,7 @@ interface RunWatchModeDependencies {
   runAuthorityTickFn: (options: { cwd: string }) => Promise<void>;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
-  registerSigint: (handler: () => void) => void;
+  registerSigint: (handler: () => void) => void | (() => void);
   setIntervalFn: (handler: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
   clearIntervalFn: (timer: ReturnType<typeof setInterval>) => void;
 }
@@ -91,7 +91,10 @@ export async function runWatchMode(
     }),
     writeStdout: deps.writeStdout ?? ((text: string) => process.stdout.write(text)),
     writeStderr: deps.writeStderr ?? ((text: string) => process.stderr.write(text)),
-    registerSigint: deps.registerSigint ?? ((handler: () => void) => process.on('SIGINT', handler)),
+    registerSigint: deps.registerSigint ?? ((handler: () => void) => {
+      process.on('SIGINT', handler);
+      return () => process.off('SIGINT', handler);
+    }),
     setIntervalFn: deps.setIntervalFn ?? ((handler: () => void, intervalMs: number) => setInterval(handler, intervalMs)),
     clearIntervalFn: deps.clearIntervalFn ?? ((timer: ReturnType<typeof setInterval>) => clearInterval(timer)),
   };
@@ -114,10 +117,13 @@ export async function runWatchMode(
     resolveDone = resolve;
   });
 
+  let unregisterSigint: void | (() => void);
   const stop = () => {
     if (stopped) return;
     stopped = true;
     if (timer) dependencies.clearIntervalFn(timer);
+    unregisterSigint?.();
+    unregisterSigint = undefined;
     dependencies.writeStdout('\x1b[?25h\x1b[2J\x1b[H');
     resolveDone();
   };
@@ -161,7 +167,7 @@ export async function runWatchMode(
     }
   };
 
-  dependencies.registerSigint(stop);
+  unregisterSigint = dependencies.registerSigint(stop);
   timer = dependencies.setIntervalFn(() => {
     void renderTick();
   }, 1000);
@@ -256,13 +262,19 @@ export function buildTmuxSplitArgs(
   omxBin: string,
   preset?: string,
   sessionId?: string,
+  omxRoot?: string,
 ): string[] {
   // Defense-in-depth: keep preset constrained even if this helper is reused.
   const safePreset = parseHudPreset(preset);
   const presetArg = safePreset ? ` --preset=${safePreset}` : '';
   const safeSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  const sessionPrefix = safeSessionId ? `OMX_SESSION_ID=${shellEscape(safeSessionId)} ` : '';
-  const cmd = `${sessionPrefix}node ${shellEscape(omxBin)} hud --watch${presetArg}`;
+  const safeOmxRoot = typeof omxRoot === 'string' ? omxRoot : '';
+  const envAssignments = [
+    safeSessionId ? `OMX_SESSION_ID=${shellEscape(safeSessionId)}` : '',
+    safeOmxRoot.trim() ? `OMX_ROOT=${shellEscape(safeOmxRoot)}` : '',
+  ].filter(Boolean);
+  const envPrefix = envAssignments.length > 0 ? `env ${envAssignments.join(' ')} ` : '';
+  const cmd = `exec ${envPrefix}${shellEscape(process.execPath)} ${shellEscape(omxBin)} hud --watch${presetArg}`;
   return ['split-window', '-v', '-l', String(HUD_TMUX_HEIGHT_LINES), '-c', cwd, cmd];
 }
 
@@ -278,7 +290,7 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     console.error('Failed to resolve OMX launcher path for tmux HUD startup.');
     process.exit(1);
   }
-  const args = buildTmuxSplitArgs(cwd, omxBin, flags.preset, process.env.OMX_SESSION_ID);
+  const args = buildTmuxSplitArgs(cwd, omxBin, flags.preset, process.env.OMX_SESSION_ID, process.env.OMX_ROOT);
 
   try {
     // Split bottom pane, 4 lines tall, running omx hud --watch.
