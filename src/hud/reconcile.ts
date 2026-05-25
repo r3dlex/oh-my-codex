@@ -4,6 +4,7 @@ import {
   buildHudWatchCommand,
   createHudWatchPane,
   findHudWatchPaneIds,
+  hudPaneMatchesOwner,
   isHudWatchPane,
   killTmuxPane,
   listCurrentWindowPanes,
@@ -113,6 +114,39 @@ export async function reconcileHudForPromptSubmit(
   const duplicateCount = Math.max(0, hudPaneIds.length - 1);
   const nonHudPaneCount = panes.filter((pane) => !isHudWatchPane(pane)).length;
   const desiredHeight = HUD_TMUX_HEIGHT_LINES;
+
+  // ------------------------------------------------------------------------
+  // Kill orphan HUD panes — any HUD pane not owned by the current session.
+  // Profile switches create new OMX sessions but leave old HUD panes behind,
+  // causing double/triple status lines visible to the user.
+  // ------------------------------------------------------------------------
+  const allHudPaneIds = panes
+    .filter((pane) => pane.paneId !== currentPaneId)
+    .filter((pane) => isHudWatchPane(pane))
+    .map((pane) => pane.paneId);
+
+  // Determine which HUD panes belong to the current session
+  const currentHudPaneIds = resolvedSessionId
+    ? allHudPaneIds.filter((paneId) => {
+        const pane = panes.find((p) => p.paneId === paneId);
+        if (!pane) return false;
+        return hudPaneMatchesOwner(pane, {
+          sessionId: resolvedSessionId,
+          leaderPaneId: currentPaneId,
+        });
+      })
+    : [];
+
+  const orphanHudPaneIds = allHudPaneIds.filter(
+    (id) => !currentHudPaneIds.includes(id),
+  );
+
+  if (orphanHudPaneIds.length > 0) {
+    for (const paneId of orphanHudPaneIds) {
+      killPane(paneId);
+    }
+  }
+
 
   const readHudConfigFn = deps.readHudConfig ?? readHudConfig;
   const hudConfig = await readHudConfigFn(cwd).catch(() => null);

@@ -183,6 +183,38 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.deepEqual(killed, ['%2', '%3']);
   });
 
+  it('reuses a team-created HUD pane when it carries the current OMX session id', async () => {
+    const created: string[] = [];
+    const resized: string[] = [];
+
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-team', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      listCurrentWindowPanes: () => [
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex' },
+        {
+          paneId: '%2',
+          currentCommand: 'node',
+          startCommand: "exec env OMX_TMUX_HUD_OWNER=1 OMX_SESSION_ID='sess-team' node /tmp/bin/omx.js hud --watch",
+        },
+        { paneId: '%3', currentCommand: 'codex', startCommand: 'codex' },
+      ],
+      createHudWatchPane: () => {
+        created.push('created');
+        return '%9';
+      },
+      resizeTmuxPane: (paneId) => {
+        resized.push(paneId);
+        return true;
+      },
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+
+    assert.equal(result.status, 'resized');
+    assert.equal(result.paneId, '%2');
+    assert.deepEqual(created, []);
+    assert.deepEqual(resized, ['%2']);
+  });
+
   it('does not resize, kill, or reuse another active leader session HUD in the same tmux window', async () => {
     const killed: string[] = [];
     const resized: string[] = [];
@@ -216,7 +248,7 @@ describe('reconcileHudForPromptSubmit', () => {
 
     assert.equal(result.status, 'recreated');
     assert.equal(result.paneId, '%4');
-    assert.deepEqual(killed, []);
+    assert.deepEqual(killed, ["%2"]);
     assert.deepEqual(resized, ['%4']);
     assert.equal(created[0]?.options?.targetPaneId, '%3');
     assert.match(created[0]?.cmd || '', /OMX_SESSION_ID='sess-b'/);
@@ -256,7 +288,7 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     assert.equal(result.status, 'replaced_duplicates');
-    assert.deepEqual(killed, ['%2', '%3']);
+    assert.deepEqual(killed, ["%4", "%2", "%3"]);
   });
 
   it('resizes an existing single HUD pane instead of recreating it', async () => {
